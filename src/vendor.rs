@@ -7,8 +7,12 @@ use std::time::Duration;
 
 use clap::ValueEnum;
 
+use crate::format::substitute;
+use crate::pacing::PaceSeverity;
+use crate::pango::{color_span, severity_color};
+use crate::theme::Theme;
 use crate::usage::VendorSnapshot;
-use crate::widget::cli::Cli;
+use crate::waybar::{Class, WaybarOutput};
 
 /// Outer reqwest client timeout shared by widget and TUI entry points.
 /// Vendor fetchers still apply their own tighter per-request timeouts.
@@ -155,6 +159,34 @@ impl VendorId {
         }
     }
 
+    /// Inverse of [`VendorId::slug`]: the single slug → vendor mapping. The
+    /// active-vendor state file, report entry ids (`<slug>@<label>`), and any
+    /// consumer that round-trips a slug go through here; an unknown, empty,
+    /// or case-mismatched slug is `None` (slugs are lowercase by contract).
+    pub fn from_slug(slug: &str) -> Option<VendorId> {
+        Some(match slug {
+            "anthropic" => VendorId::Anthropic,
+            "anthropic_api" => VendorId::AnthropicApi,
+            "openai" => VendorId::Openai,
+            "openai_api" => VendorId::OpenaiApi,
+            "zai" => VendorId::Zai,
+            "openrouter" => VendorId::Openrouter,
+            "deepseek" => VendorId::Deepseek,
+            "kimi" => VendorId::Kimi,
+            "kilo" => VendorId::Kilo,
+            "novita" => VendorId::Novita,
+            "moonshot" => VendorId::Moonshot,
+            "grok" => VendorId::Grok,
+            "supergrok" => VendorId::Supergrok,
+            "antigravity" => VendorId::Antigravity,
+            "cursor" => VendorId::Cursor,
+            "minimax" => VendorId::Minimax,
+            "kiro" => VendorId::Kiro,
+            "opencode-go" => VendorId::OpenCodeGo,
+            _ => return None,
+        })
+    }
+
     /// Canonical human-readable name for shared reports and compact UI labels.
     /// Platform frontends may add context (for example, "GLM (Z.AI)" in a
     /// wide TUI tab), but should not carry their own full vendor-name table.
@@ -269,6 +301,59 @@ pub struct VendorOutcome {
     pub cache_age: Option<std::time::Duration>,
 }
 
+/// A vendor fetch result that can be split into the vendor-agnostic
+/// [`VendorOutcome`] plus the typed snapshot its renderer takes — the pair
+/// every `widget::run` dispatch needs. Implemented for every vendor's
+/// `fetch::FetchOutcome` so the widget's shared
+/// fetch → transient-fallback → render pipeline can replace a per-vendor
+/// copy of the same ten lines.
+pub trait VendorFetchOutcome: Sized + Into<VendorOutcome> {
+    /// The typed snapshot this vendor's `vendor::render` expects.
+    type Snapshot: Clone;
+    /// Borrow the typed snapshot while the outcome is still intact.
+    fn typed_snapshot(&self) -> &Self::Snapshot;
+    /// Split into the vendor-agnostic outcome and the typed snapshot. The
+    /// snapshot is cloned first because `Into<VendorOutcome>` consumes
+    /// `self` whole.
+    fn into_parts(self) -> (VendorOutcome, Self::Snapshot) {
+        let snapshot = self.typed_snapshot().clone();
+        (self.into(), snapshot)
+    }
+}
+
+macro_rules! impl_vendor_fetch_outcome {
+    ($($outcome:path => $snapshot:ty),* $(,)?) => {
+        $(
+            impl VendorFetchOutcome for $outcome {
+                type Snapshot = $snapshot;
+                fn typed_snapshot(&self) -> &Self::Snapshot {
+                    &self.snapshot
+                }
+            }
+        )*
+    };
+}
+
+impl_vendor_fetch_outcome! {
+    crate::anthropic_api::fetch::FetchOutcome => crate::usage::AnthropicApiSnapshot,
+    crate::antigravity::fetch::FetchOutcome => crate::usage::AntigravitySnapshot,
+    crate::cursor::fetch::FetchOutcome => crate::usage::CursorSnapshot,
+    crate::deepseek::fetch::FetchOutcome => crate::usage::DeepseekSnapshot,
+    crate::grok::fetch::FetchOutcome => crate::usage::GrokSnapshot,
+    crate::kilo::fetch::FetchOutcome => crate::usage::KiloSnapshot,
+    crate::kimi::fetch::FetchOutcome => crate::usage::KimiSnapshot,
+    crate::kiro::fetch::FetchOutcome => crate::usage::KiroSnapshot,
+    crate::minimax::fetch::FetchOutcome => crate::usage::MinimaxSnapshot,
+    crate::moonshot::fetch::FetchOutcome => crate::usage::MoonshotSnapshot,
+    crate::novita::fetch::FetchOutcome => crate::usage::NovitaSnapshot,
+    crate::openai::fetch::FetchOutcome => crate::usage::OpenAiSnapshot,
+    crate::openai_api::fetch::FetchOutcome => crate::usage::OpenAiApiSnapshot,
+    crate::opencode_go::fetch::FetchOutcome => crate::opencode_go::types::Usage,
+    crate::openrouter::fetch::FetchOutcome => crate::usage::OpenRouterSnapshot,
+    crate::supergrok::fetch::FetchOutcome => crate::usage::SuperGrokSnapshot,
+    crate::zai::fetch::FetchOutcome => crate::usage::ZaiSnapshot,
+}
+
 /// Options forwarded to renderers from the CLI.
 #[derive(Debug, Clone)]
 pub struct RenderOpts {
@@ -280,16 +365,58 @@ pub struct RenderOpts {
     pub tooltip_pace_pts: bool,
 }
 
-impl RenderOpts {
-    pub fn from_cli(cli: &Cli) -> Self {
-        Self {
-            format: cli.format.clone(),
-            tooltip_format: cli.tooltip_format.clone(),
-            icon: cli.icon.clone(),
-            pace_tolerance: cli.pace_tolerance,
-            format_pace_color: cli.format_pace_color,
-            tooltip_pace_pts: cli.tooltip_pace_pts,
-        }
+/// Shared Waybar render shell: the pipeline every vendor's `render()` repeats,
+/// ported byte-for-byte from the canonical `openrouter::vendor::render`
+/// (src/openrouter/vendor.rs:68-110). Order, and what it means:
+///   1. resolve the format — `--format` wins, else the vendor's default;
+///   2. rewrite claudebar's `${token}` spelling to `{token}`;
+///   3. substitute the placeholder map (unknown keys pass through);
+///   4. append `" ⏸"` (leading space) when the outcome is stale;
+///   5. wrap icon + text in a `<span>` colored by the severity tier;
+///   6. tooltip = substituted `--tooltip-format`, else `default_tooltip`.
+///
+/// `values` is substituted VERBATIM — no Pango escaping happens here.
+/// Placeholders that can carry untrusted text must be pre-escaped inside the
+/// vendor's `build_placeholders` (the render-sink rule).
+///
+/// `severity = None` renders unwrapped (uncolored) text with the neutral
+/// `Class::Low`; real vendors always pass their snapshot's severity.
+pub fn render_shell(
+    default_format: &str,
+    values: &std::collections::HashMap<&str, String>,
+    opts: &RenderOpts,
+    stale: bool,
+    severity: Option<PaceSeverity>,
+    theme: &Theme,
+    default_tooltip: String,
+) -> WaybarOutput {
+    let class = Class::from(severity.unwrap_or(PaceSeverity::Low));
+    let format = opts
+        .format
+        .clone()
+        .unwrap_or_else(|| default_format.to_string());
+    let format_clean = format.replace("${", "{");
+    let mut text = substitute(&format_clean, values);
+    if stale {
+        text.push_str(" ⏸");
+    }
+    let icon_prefix = match opts.icon.as_deref() {
+        Some(ic) if !ic.is_empty() => format!("{ic} "),
+        _ => String::new(),
+    };
+    let bar_text = match severity {
+        Some(sev) => color_span(severity_color(sev, theme), &format!("{icon_prefix}{text}")),
+        None => format!("{icon_prefix}{text}"),
+    };
+    let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
+        substitute(&fmt.replace("${", "{"), values)
+    } else {
+        default_tooltip
+    };
+    WaybarOutput {
+        text: bar_text,
+        tooltip,
+        class,
     }
 }
 
@@ -506,6 +633,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_slug_round_trips_every_vendor() {
+        for id in VendorId::all() {
+            assert_eq!(VendorId::from_slug(id.slug()), Some(*id));
+        }
+    }
+
+    #[test]
+    fn from_slug_rejects_unknown_empty_and_case_mismatches() {
+        assert_eq!(VendorId::from_slug(""), None);
+        assert_eq!(VendorId::from_slug("not-a-vendor"), None);
+        assert_eq!(VendorId::from_slug("ANTHROPIC"), None);
+        assert_eq!(VendorId::from_slug("Anthropic"), None);
+    }
+
     /// Every logo id resolves to exactly one bundled asset, and same-brand
     /// vendors share one deliberately: Grok/SuperGrok are one asset, so the
     /// distinct set is one smaller than the vendor list — but two different
@@ -517,11 +659,7 @@ mod tests {
         for vendor in VendorId::all() {
             vendors += 1;
             let logo = vendor.logo_slug();
-            assert!(
-                !logo.is_empty(),
-                "{} has no logo asset id",
-                vendor.slug()
-            );
+            assert!(!logo.is_empty(), "{} has no logo asset id", vendor.slug());
             assert!(
                 logo.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
                 "{logo} is not a slug"
@@ -540,5 +678,211 @@ mod tests {
         );
         assert_eq!(VendorId::Anthropic.logo_slug(), "claude");
         assert_eq!(VendorId::Antigravity.logo_slug(), "antigravity");
+    }
+
+    fn shell_opts() -> RenderOpts {
+        RenderOpts {
+            format: None,
+            tooltip_format: None,
+            icon: None,
+            pace_tolerance: 5,
+            format_pace_color: false,
+            tooltip_pace_pts: false,
+        }
+    }
+
+    fn shell_values() -> std::collections::HashMap<&'static str, String> {
+        crate::format::placeholders(vec![("or_balance", "$74.50"), ("or_used_today", "$1.00")])
+    }
+
+    /// Hand-replicates openrouter's steps (default `${…}` format → `${`→`{` →
+    /// substitute → severity span) for the fixture above; the expected string
+    /// is written out byte by byte, never produced by a vendor render fn.
+    #[test]
+    fn default_format_render_matches_the_hand_built_expectation() {
+        let out = render_shell(
+            "${or_balance} · ${or_used_today}",
+            &shell_values(),
+            &shell_opts(),
+            false,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        // One Dark green = theme.green (theme.rs ONE_DARK_GREEN).
+        assert_eq!(out.text, "<span foreground='#98c379'>$74.50 · $1.00</span>");
+        assert_eq!(out.tooltip, "TOOLTIP");
+        assert_eq!(out.class, Class::Low);
+    }
+
+    #[test]
+    fn stale_appends_the_pause_glyph_with_a_leading_space() {
+        let out = render_shell(
+            "{or_balance} · {or_used_today}",
+            &shell_values(),
+            &shell_opts(),
+            true,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        assert_eq!(
+            out.text,
+            "<span foreground='#98c379'>$74.50 · $1.00 ⏸</span>"
+        );
+    }
+
+    #[test]
+    fn custom_icon_is_prefixed_inside_the_color_span() {
+        let mut o = shell_opts();
+        o.icon = Some("󱙺".into());
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &o,
+            false,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        assert_eq!(out.text, "<span foreground='#98c379'>󱙺 $74.50</span>");
+    }
+
+    /// Port fidelity: an empty `--icon` must not add a lone space.
+    #[test]
+    fn empty_icon_adds_no_prefix() {
+        let mut o = shell_opts();
+        o.icon = Some(String::new());
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &o,
+            false,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        assert_eq!(out.text, "<span foreground='#98c379'>$74.50</span>");
+    }
+
+    #[test]
+    fn custom_tooltip_format_beats_the_default_tooltip() {
+        let mut o = shell_opts();
+        o.tooltip_format = Some("bal: ${or_balance}".into());
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &o,
+            false,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "DEFAULT TOOLTIP".into(),
+        );
+        assert_eq!(out.tooltip, "bal: $74.50");
+    }
+
+    /// Cross-check against the string openrouter's own suite pins byte for
+    /// byte in `openrouter::vendor::tests::custom_tooltip_uses_placeholders`
+    /// ("bal: $74.50 | mtd: $25.50" for these literal values).
+    #[test]
+    fn cross_checks_openrouter_pinned_tooltip_byte_for_byte() {
+        let values = crate::format::placeholders(vec![
+            ("or_balance", "$74.50"),
+            ("or_used_month", "$25.50"),
+        ]);
+        let mut o = shell_opts();
+        o.tooltip_format = Some("bal: {or_balance} | mtd: {or_used_month}".into());
+        let out = render_shell(
+            "",
+            &values,
+            &o,
+            false,
+            None,
+            &Theme::default(),
+            "UNUSED".into(),
+        );
+        assert_eq!(out.tooltip, "bal: $74.50 | mtd: $25.50");
+    }
+
+    /// claudebar's `${or_balance}` spelling works in user-supplied formats.
+    #[test]
+    fn claudebar_dollar_brace_tokens_still_substitute() {
+        let mut o = shell_opts();
+        o.format = Some("${or_balance} remaining".into());
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &o,
+            false,
+            Some(PaceSeverity::Low),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        assert_eq!(
+            out.text,
+            "<span foreground='#98c379'>$74.50 remaining</span>"
+        );
+    }
+
+    /// Contract boundary: render_shell never escapes. Values that can carry
+    /// untrusted text are pre-escaped in each vendor's build_placeholders.
+    #[test]
+    fn values_are_substituted_verbatim_escaping_belongs_to_the_caller() {
+        let values = crate::format::placeholders(vec![("or_label", "<b>&raw</b>")]);
+        let out = render_shell(
+            "{or_label}",
+            &values,
+            &shell_opts(),
+            false,
+            None,
+            &Theme::default(),
+            String::new(),
+        );
+        assert_eq!(out.text, "<b>&raw</b>");
+    }
+
+    #[test]
+    fn unknown_placeholders_pass_through_literally() {
+        let out = render_shell(
+            "{nope}",
+            &std::collections::HashMap::new(),
+            &shell_opts(),
+            false,
+            None,
+            &Theme::default(),
+            String::new(),
+        );
+        assert_eq!(out.text, "{nope}");
+    }
+
+    #[test]
+    fn no_severity_renders_uncolored_text() {
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &shell_opts(),
+            false,
+            None,
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        assert_eq!(out.text, "$74.50");
+        assert_eq!(out.class, Class::Low);
+    }
+
+    #[test]
+    fn class_follows_the_severity_tier() {
+        let out = render_shell(
+            "{or_balance}",
+            &shell_values(),
+            &shell_opts(),
+            false,
+            Some(PaceSeverity::Critical),
+            &Theme::default(),
+            "TOOLTIP".into(),
+        );
+        // One Dark red = theme.red (theme.rs ONE_DARK_RED).
+        assert_eq!(out.text, "<span foreground='#e06c75'>$74.50</span>");
+        assert_eq!(out.class, Class::Critical);
     }
 }

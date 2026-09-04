@@ -32,6 +32,20 @@ use crate::error::{AppError, Result};
 /// Generic-password *service* name Claude Code uses for the credentials blob.
 const SERVICE: &str = "Claude Code-credentials";
 
+/// First whitespace-delimited token of `shasum(1)` output, cut to the 8 hex
+/// chars the scoped service name uses. `shasum` prints `<digest>  -` for
+/// stdin input, so the first token is the digest. `None` when the output is
+/// empty or shorter than 8 chars.
+fn shasum_hash(stdout: &str) -> Option<&str> {
+    stdout.split_whitespace().next().and_then(|h| h.get(..8))
+}
+
+/// The per-account service name for a `CLAUDE_CONFIG_DIR`-scoped login:
+/// the default service suffixed with the config-dir hash.
+fn scoped_service_name(hash: &str) -> String {
+    format!("{SERVICE}-{hash}")
+}
+
 /// The per-account service name for a `CLAUDE_CONFIG_DIR`-scoped login. Shells
 /// out to `shasum(1)` rather than pulling in a `sha2` crate — same rationale
 /// as the rest of this module.
@@ -52,12 +66,9 @@ fn service_name_for(config_dir: &Path) -> Result<String> {
         .wait_with_output()
         .map_err(|e| AppError::Other(format!("could not run `shasum`: {e}")))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let hash = stdout
-        .split_whitespace()
-        .next()
-        .and_then(|h| h.get(..8))
+    let hash = shasum_hash(&stdout)
         .ok_or_else(|| AppError::Other("shasum produced unexpected output".into()))?;
-    Ok(format!("{SERVICE}-{hash}"))
+    Ok(scoped_service_name(hash))
 }
 
 /// The Keychain item's *account* is the macOS short username. We match on it
@@ -89,6 +100,19 @@ pub fn read_raw() -> Result<Option<String>> {
 /// Keychain item instead of the default one.
 pub fn read_raw_for(config_dir: &Path) -> Result<Option<String>> {
     read_raw_service(&service_name_for(config_dir)?)
+}
+
+/// `security(1) -w` prints the password followed by one newline; an empty
+/// item prints nothing. `Err` when the item holds non-UTF-8 bytes.
+fn password_value(stdout: Vec<u8>) -> Result<Option<String>> {
+    let value = String::from_utf8(stdout)
+        .map_err(|e| AppError::Other(format!("Keychain value was not UTF-8: {e}")))?;
+    let value = value.trim_end_matches('\n').to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn read_raw_service(service: &str) -> Result<Option<String>> {
@@ -124,14 +148,7 @@ fn read_raw_service(service: &str) -> Result<Option<String>> {
         )));
     }
 
-    let value = String::from_utf8(out.stdout)
-        .map_err(|e| AppError::Other(format!("Keychain value was not UTF-8: {e}")))?;
-    let value = value.trim_end_matches('\n').to_string();
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
+    Ok(password_value(out.stdout)?)
 }
 
 /// Persist updated credentials JSON back to the *same* Keychain item, so the
@@ -207,4 +224,62 @@ fn delete_raw_service(service: &str) -> Result<()> {
         out.status.code().unwrap_or(-1),
         detail.trim()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shasum_hash_takes_the_first_eight_hex_chars_of_the_digest() {
+        assert_eq!(
+            shasum_hash("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -\n"),
+            Some("e3b0c442")
+        );
+        // A path label rides after the digest; only the first token counts.
+        assert_eq!(
+            shasum_hash("0123456789abcdef  /Users/al/.claude-work"),
+            Some("01234567")
+        );
+    }
+
+    #[test]
+    fn shasum_hash_rejects_short_or_empty_output() {
+        assert_eq!(shasum_hash(""), None);
+        assert_eq!(shasum_hash("\n  \n"), None);
+        assert_eq!(shasum_hash("deadbee"), None);
+    }
+
+    #[test]
+    fn scoped_service_name_appends_the_hash_to_the_default_service() {
+        assert_eq!(
+            scoped_service_name("e3b0c442"),
+            "Claude Code-credentials-e3b0c442"
+        );
+    }
+
+    #[test]
+    fn password_value_strips_the_trailing_newline() {
+        assert_eq!(
+            password_value(b"{\"claudeAiOauth\": {\"access_token\": \"tok\"}}\n".to_vec()).unwrap(),
+            Some("{\"claudeAiOauth\": {\"access_token\": \"tok\"}}".to_string())
+        );
+        // Multi-line credential JSON keeps its interior newlines.
+        let multiline = b"{\n  \"claudeAiOauth\": {}\n}\n".to_vec();
+        assert_eq!(
+            password_value(multiline).unwrap(),
+            Some("{\n  \"claudeAiOauth\": {}\n}".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_security_output_is_no_item_not_an_error() {
+        assert_eq!(password_value(Vec::new()).unwrap(), None);
+        assert_eq!(password_value(b"\n".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn non_utf8_keychain_value_is_an_error() {
+        assert!(password_value(vec![0xff, 0xfe, b'\n']).is_err());
+    }
 }

@@ -21,6 +21,9 @@ ColumnLayout {
 
     readonly property bool isMetric: item.row && item.row.type === "metric"
     readonly property string detail: item.isMetric ? Logic.metricDetail(item.row) : ""
+    // '' paints plain; otherwise a band/severity key into Logic.severityColor
+    // — the same tone rule omarchy/Panel.qml's MetricRow applies.
+    readonly property string tone: item.isMetric ? Logic.metricTone(item.row) : ""
 
     spacing: 0
 
@@ -39,8 +42,9 @@ ColumnLayout {
         PlasmaComponents.Label {
             font.bold: true
             visible: text !== ""
-            color: item.isMetric && item.row.severity === "critical"
-                ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+            color: item.tone !== ""
+                ? (Logic.severityColor(item.tone, item.colors) ?? Kirigami.Theme.textColor)
+                : Kirigami.Theme.textColor
             text: {
                 if (!item.row)
                     return "";

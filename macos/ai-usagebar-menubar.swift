@@ -41,6 +41,11 @@ let SETTINGS_DEFAULTS: [String: Any] = [
     "binaryPath": "",
 ]
 
+// App version, shown read-only in Preferences → Sistema. Must equal `version`
+// in Cargo.toml (asserted by CI-style grep); bump whenever macos/ changes —
+// the same independent-version convention as the KDE plasmoid / GNOME extension.
+let appVersion = "1.9.0"
+
 var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
 var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v : 30 }
 /// Upper bound on one `ai-usagebar` invocation. It can block on the cache
@@ -1460,6 +1465,8 @@ struct SettingsView: View {
                             Text("Não foi possível atualizar: \(error)")
                                 .font(.caption).foregroundColor(.red)
                         }
+                        Text("Versão: \(appVersion)")
+                            .font(.caption).foregroundColor(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

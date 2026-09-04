@@ -47,9 +47,8 @@ pub fn redact_token_shapes(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut i = 0;
     let key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-    let token_char = |c: char| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | '+' | '/' | '=')
-    };
+    let token_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | '+' | '/' | '=');
     let opaque_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_');
     while i < chars.len() {
         // `sk-<8+ key chars>` — the vendor key prefixes.

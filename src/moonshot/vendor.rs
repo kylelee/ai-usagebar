@@ -5,14 +5,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{money, placeholders, substitute, updated_at_hm};
+use crate::format::{money, placeholders, updated_at_hm};
 use crate::pacing::PaceSeverity;
-use crate::pango::{color_span, escape, severity_color};
+use crate::pango::{escape, severity_color};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::MoonshotSnapshot;
-use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
-use crate::waybar::{Class, WaybarOutput};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome, render_shell};
+use crate::waybar::WaybarOutput;
 
 use super::fetch::FetchOutcome;
 
@@ -64,36 +64,15 @@ pub fn render(
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> WaybarOutput {
-    let class = Class::from(severity(snap));
-    let format = opts
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders(snap);
-
-    let mut text = substitute(&format, &values);
-    if outcome.stale {
-        text.push_str(" ⏸");
-    }
-
-    let wrapper_color = severity_color(severity(snap), theme).to_string();
-    let icon_prefix = match opts.icon.as_deref() {
-        Some(ic) if !ic.is_empty() => format!("{ic} "),
-        _ => String::new(),
-    };
-    let bar_text = color_span(&wrapper_color, &format!("{icon_prefix}{text}"));
-
-    let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
-        substitute(fmt, &values)
-    } else {
-        render_tooltip(outcome, snap, theme, now)
-    };
-
-    WaybarOutput {
-        text: bar_text,
-        tooltip,
-        class,
-    }
+    render_shell(
+        DEFAULT_FORMAT,
+        &build_placeholders(snap),
+        opts,
+        outcome.stale,
+        Some(severity(snap)),
+        theme,
+        render_tooltip(outcome, snap, theme, now),
+    )
 }
 
 fn render_tooltip(

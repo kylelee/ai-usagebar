@@ -1,3 +1,9 @@
+//! Deliberately NOT migrated to the shared `crate::fetch` pipeline (todo 14
+//! documented exception): this module's CSRF-guarded loopback-RPC server
+//! discovery and "always arrives last and therefore always wins" event merge
+//! share no cached-fetch skeleton with the REST vendors — and `claude_desktop`
+//! (merge semantics of its own) stays bespoke for the same reason.
+//!
 //! Fetch a Google Antigravity usage snapshot from a local language server.
 //!
 //! Google ships three separate Antigravity products — Antigravity 2.0, the

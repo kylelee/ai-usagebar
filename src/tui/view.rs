@@ -254,7 +254,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let Some(tab) = app.tabs.get(app.active) else {
         return;
     };
-    let sections = panels::sections_for(tab, chrono::Utc::now(), 5);
+    let sections = panels::sections_for(tab, chrono::Utc::now(), crate::pacing::DEFAULT_TOLERANCE);
     panels::render(f, inner, &app.theme, &sections);
 }
 
@@ -331,10 +331,16 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
                     spans.push(theme.muted("  ↻"));
                 }
             }
-            Some(TabState::Error(_)) => spans.push(Span::styled(
-                "error",
-                Style::default().fg(theme.palette.error),
-            )),
+            Some(TabState::Error(msg)) => {
+                spans.push(Span::styled(
+                    "error",
+                    Style::default().fg(theme.palette.error),
+                ));
+                let detail = brief_error(msg);
+                if !detail.is_empty() {
+                    spans.push(theme.muted(format!(" — {detail}")));
+                }
+            }
             Some(TabState::Loading) | None => spans.push(theme.muted("fetching…")),
         }
         lines.push(Line::from(spans));
@@ -362,23 +368,57 @@ fn tab_status(tab: Option<&TabState>, refreshing: bool) -> &'static str {
     }
 }
 
+/// Char budget for the one-line error brief shown in the overview rows and
+/// the footer reload status.
+const ERROR_BRIEF_MAX_CHARS: usize = 40;
+
+/// One sanitized line, capped by chars: the glanceable tail of a vendor or
+/// config error. Sanitize FIRST — a control byte must neither reach the TUI
+/// nor spend the char budget — then truncate by chars so UTF-8 never splits.
+fn brief_error(err: &str) -> String {
+    crate::display::sanitize_untrusted_line(err)
+        .chars()
+        .take(ERROR_BRIEF_MAX_CHARS)
+        .collect()
+}
+
+/// The footer keybinding hints; `context_enabled` adds the `c` binding.
+fn footer_bindings(context_enabled: bool) -> Vec<KeyBinding> {
+    let mut bindings = vec![
+        KeyBinding::with_keys(["tab", "↑↓/h/l"], "switch"),
+        KeyBinding::new("r", "refresh"),
+        KeyBinding::new("R", "refresh all"),
+        KeyBinding::new("s", "settings"),
+    ];
+    if context_enabled {
+        bindings.push(KeyBinding::new("c", "context"));
+    }
+    bindings.push(KeyBinding::with_keys(["q", "esc"], "quit"));
+    bindings
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    // A failed config hot-reload takes over the footer line until the next
+    // successful reload clears it — a silently broken config is worse than a
+    // temporarily hidden hint row.
+    if let Some(error) = &app.config_reload_error {
+        let bubble = bubble_theme(&app.theme);
+        let line = Line::from(vec![
+            Span::styled(
+                "⚠ config reload failed: ",
+                Style::default().fg(color(&app.theme.red).unwrap_or(bubble.palette.error)),
+            ),
+            Span::styled(brief_error(error), bubble.muted),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     // The "updated HH:MM:SS" suffix used to live here, but it was
     // (a) redundant with the per-tab "Updated …" now right-aligned on the
     // title row of every panel, and (b) prone to getting cropped on narrow
     // 875x600 windows. Keep the footer to just the keybinding hints.
     let theme = bubble_theme(&app.theme);
-    let mut bindings = vec![
-        KeyBinding::with_keys(["tab", "h/l"], "switch"),
-        KeyBinding::new("r", "refresh"),
-        KeyBinding::new("R", "refresh all"),
-        KeyBinding::new("s", "settings"),
-    ];
-    if app.context_enabled {
-        bindings.push(KeyBinding::new("c", "context"));
-    }
-    bindings.push(KeyBinding::with_keys(["q", "esc"], "quit"));
-    let help = Help::new(bindings).theme(theme);
+    let help = Help::new(footer_bindings(app.context_enabled)).theme(theme);
     f.render_widget(&help, area);
 }
 
@@ -550,6 +590,35 @@ mod tests {
 
         let enabled = rendered(app_with(vec![TabState::Loading, TabState::Loading]), true);
         assert!(enabled.contains("context"));
+    }
+
+    /// The tab strip also walks with ↑↓ (handle_key), so the switch hint must
+    /// name the arrow keys alongside the vim chars.
+    #[test]
+    fn footer_switch_hint_names_the_arrow_keys() {
+        let out = body_text(&app_with(vec![TabState::Loading, TabState::Loading]));
+        assert!(out.contains("↑↓/h/l"), "{out}");
+    }
+
+    /// Sanitize-then-truncate: the escape is removed BEFORE the 40-char
+    /// budget is spent, so 40 clean chars remain (truncate-first would spend
+    /// one on the ESC and return only 39).
+    #[test]
+    fn error_brief_sanitizes_control_chars_before_truncating() {
+        let err = format!("\u{1b}{}", "word ".repeat(12));
+        let brief = brief_error(&err);
+        assert_eq!(brief.chars().count(), 40);
+        assert!(!brief.chars().any(char::is_control));
+        assert!(brief.starts_with("word "), "{brief}");
+    }
+
+    /// Newlines fold away so the row stays one line, control bytes vanish,
+    /// and ordinary prose (even a raw `<`) survives — ratatui cells are not
+    /// markup.
+    #[test]
+    fn error_brief_is_one_sanitized_plain_line() {
+        assert_eq!(brief_error("line1\n<line2>\u{7}"), "line1 <line2>");
+        assert_eq!(brief_error(""), "");
     }
 
     /// Renders `draw_main` alone (no header/footer) into `width x height` and

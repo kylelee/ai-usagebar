@@ -5,8 +5,9 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch;
 use crate::usage::{MoonshotSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
@@ -14,8 +15,6 @@ use super::types::{BalanceEnvelope, to_snapshot};
 
 pub const BASE_GLOBAL: &str = "https://api.moonshot.ai";
 pub const BASE_CN: &str = "https://api.moonshot.cn";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -50,13 +49,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: MoonshotSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = fetch::FetchOutcome<MoonshotSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -66,42 +59,22 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
     currency: &str,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     let target = target_key(endpoints, currency);
-
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, &target)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, api_key, currency).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(
-                &serde_json::json!({ "target": target, "snapshot": serde_repr(&snap) }),
-            )?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), &target, e)
-        }
-    }
+    fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        fetch_live(client, endpoints, api_key, currency),
+        |payload| parse_cache(payload.as_bytes(), &target).ok(),
+        |snap| {
+            serde_json::to_string(&serde_json::json!({
+                "target": target,
+                "snapshot": serde_repr(snap),
+            }))
+            .unwrap_or_default()
+        },
+    )
+    .await
 }
 
 /// Identity of the account+region the cached figure belongs to. `.ai` reports
@@ -109,43 +82,6 @@ pub async fn fetch_snapshot(
 /// misleading — once the user points the vendor at the other region.
 fn target_key(endpoints: &Endpoints, currency: &str) -> String {
     format!("{}|{}", endpoints.balance, currency)
-}
-
-fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // A cache we cannot attribute to this target is no better than no cache.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
-    let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
 }
 
 fn serde_repr(snap: &MoonshotSnapshot) -> serde_json::Value {
@@ -195,7 +131,7 @@ async fn fetch_live(
     currency: &str,
 ) -> Result<MoonshotSnapshot> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(&endpoints.balance)
             .header("Authorization", format!("Bearer {api_key}"))

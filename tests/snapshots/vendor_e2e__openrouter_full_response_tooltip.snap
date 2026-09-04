@@ -1,0 +1,23 @@
+---
+source: tests/vendor_e2e.rs
+expression: "normalize_updated_time(&out.tooltip, outcome.cache_age)"
+---
+<span foreground='#61afef'>╭──────────────────────────────────────────────╮</span>
+<span foreground='#61afef'>│</span>              <span font_weight='bold' foreground='#61afef'>OpenRouter — prod</span>               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>────────────────────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰢗  Balance</span>                                 <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>█████</span><span foreground='#3e4451'>░░░░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>$74.50</span>               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  $25.50 of $100.00 used (26%)</span>               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰸘  Usage</span>                                   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>     today $1.00 · week $7.00 · month $25.50</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󱁻  Per-key limit</span>                           <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>     $24.50 of $50.00 remaining</span>              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  󰓹  paid tier</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                              <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>────────────────────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  󰅐  Updated HH:MM</span>                           <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>╰──────────────────────────────────────────────╯</span>

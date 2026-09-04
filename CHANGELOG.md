@@ -7,6 +7,83 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Each release is also published at
 <https://github.com/KyleLee/ai-usagebar-omarchy/releases>.
 
+## [Unreleased]
+
+### Added
+
+- **`make release-bump V=X.Y.Z`** — the mechanical half of the release
+  checklist in one command: `Cargo.toml` + `manifest.json` versions, both
+  PKGBUILDs (`pkgver`, `pkgrel=1`, sha256s reset to `'SKIP'`), both
+  `.SRCINFO`s, and the `[Unreleased]` compare link. Aborts on a dirty
+  tree, never commits or tags, and ends with `make release-check`. Writing
+  the release's own CHANGELOG section (checklist step 2) stays manual, and
+  on Arch `makepkg --printsrcinfo` remains the authoritative `.SRCINFO`
+  regeneration.
+
+- **TUI Settings parity for the OpenAI API vendor**: the overlay now edits
+  the `[openai_api]` Admin key and per-account `monthly_limit` exactly
+  like the Anthropic API cards.
+
+- **Wider test coverage behind the vendors**: mockito end-to-end suites
+  for Z.AI, OpenRouter, and OpenAI; OpenAI API render/DTO tests and
+  pure-logic macOS keychain tests; live smoke tests for eight more
+  vendors (`make smoke`), each skipping itself gracefully when its
+  credential is absent. The aggregate path also gained a malformed-input
+  pin — an empty tab list yields no entries instead of a panic.
+
+- **CI hardening**: qmllint on Linux, cargo doctests, concurrency groups
+  on the release workflow, and a qemu-boot smoke test of the aarch64
+  release binary before publishing.
+
+### Changed
+
+- **Error states guide instead of alarming.** A vendor that is simply
+  not configured yet — no key, no first login — is now classified
+  structurally (`AppError::Unconfigured`) as the calm remedy state, so
+  first-run guidance (run the vendor CLI once, set `enabled = true`, or
+  press `s` for settings) survives any rewording instead of depending on
+  string-matching.
+
+- **CLI/TUI feedback**: reload failures are surfaced instead of silently
+  swallowed, unknown `--format`/`--tooltip-format` placeholders are
+  reported by name, and the first-run config template drop says where it
+  landed.
+
+- **GNOME extension** derives its vendor list from the report model
+  instead of a hardcoded table, localizes its menu items via gettext, and
+  ships docs that match what it actually monitors.
+
+- **Docs synchronized with the code they describe**: README
+  smoke/install/settings/pacing notes, placeholder defaults and the
+  provider matrix, the 1.9.0 account model in the Omarchy README, the
+  macOS overview keys, and the zh-CN README.
+
+- **Internal**: one shared cached-fetch pipeline and Waybar render shell
+  replace the per-vendor copies — every migration was pinned
+  byte-identical by existing vendor tests (antigravity's bespoke loopback
+  pipeline deliberately stays apart); `config.rs` split into submodules;
+  tab enumeration hoisted into a neutral `tabs` module; slug, percentage,
+  and money helpers single-sourced.
+
+### Fixed
+
+- **Tooltips render correctly everywhere**: custom `--tooltip-format`
+  values are Pango-escaped, wrapping computes wide-glyph (CJK) and
+  control-character widths honestly, and rows no longer mis-size or
+  clip.
+
+- **`--vendor all` cold start is bounded** — a 45-second deadline
+  replaces the unbounded first fetch, and the state where every tab
+  errored surfaces a `⚠` cue instead of masquerading as empty success.
+
+- **macOS menubar app shows its version** (Preferences → System) from a
+  single constant that tracks `Cargo.toml`, and its docs no longer
+  overstate which vendors it monitors.
+
+- **KDE plasmoid re-runs the vendor probe when the widget's settings
+  change**, so a newly configured account appears without re-adding the
+  applet.
+
 ## [1.9.0] — 2026-08-30
 
 ### Added

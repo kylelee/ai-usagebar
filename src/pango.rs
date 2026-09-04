@@ -131,9 +131,10 @@ fn repeat_char(c: char, n: u32) -> String {
     std::iter::repeat_n(c, n as usize).collect()
 }
 
-/// Count the visible width of a Pango-marked string (its character count with
-/// all `<span …>…</span>` tags stripped). Used by the bordered-box renderer
-/// for padding alignment — claudebar implements this with `sed 's/<[^>]*>//g'`.
+/// Count the visible width of a Pango-marked string (its cell count with
+/// all `<span …>…</span>` tags stripped; East-Asian wide glyphs occupy two
+/// cells). Used by the bordered-box renderer for padding alignment —
+/// claudebar implements this with `sed 's/<[^>]*>//g'`.
 pub fn visible_width(s: &str) -> usize {
     let mut depth = 0usize;
     let mut count = 0usize;
@@ -156,7 +157,7 @@ pub fn visible_width(s: &str) -> usize {
             }
             _ => {
                 if depth == 0 {
-                    count += 1;
+                    count += if is_wide(ch) { 2 } else { 1 };
                 }
                 ch.len_utf8()
             }
@@ -164,6 +165,26 @@ pub fn visible_width(s: &str) -> usize {
         rest = &rest[step..];
     }
     count
+}
+
+/// East-Asian Wide/Fullwidth cell test (Unicode EastAsianWidth W and F
+/// columns), inlined as a range table — no unicode-width dependency.
+fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F      // Hangul Jamo
+        | 0x2E80..=0x303E    // CJK radicals, Kangxi, CJK symbols/punctuation
+        | 0x3041..=0x33FF    // Hiragana .. CJK compatibility
+        | 0x3400..=0x4DBF    // CJK Extension A
+        | 0x4E00..=0x9FFF    // CJK Unified Ideographs
+        | 0xA000..=0xA4CF    // Yi syllables
+        | 0xAC00..=0xD7A3    // Hangul Syllables
+        | 0xF900..=0xFAFF    // CJK Compatibility Ideographs
+        | 0xFE30..=0xFE6F    // CJK Compatibility Forms
+        | 0xFF00..=0xFF60    // Fullwidth Forms (half 1)
+        | 0xFFE0..=0xFFE6    // Fullwidth signs
+        | 0x20000..=0x2FFFD  // CJK Extensions B..F
+        | 0x30000..=0x3FFFD  // CJK Extension G
+    )
 }
 
 /// Byte length of the XML entity starting at `s` (which begins with `&`), or
@@ -348,5 +369,32 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// East-Asian wide glyphs occupy two terminal cells; counting them as
+    /// one left CJK tooltip rows short of the right border.
+    #[test]
+    fn visible_width_counts_wide_glyphs_as_two() {
+        assert_eq!(visible_width("你好"), 4);
+        assert_eq!(visible_width("好"), 2);
+        assert_eq!(visible_width(""), 0);
+        // Wide + ASCII mix: pre-fix this measured 3.
+        assert_eq!(visible_width("a好b"), 4);
+        assert_eq!(visible_width("한글"), 4);
+        assert_eq!(visible_width("ああ"), 4);
+        assert_eq!(visible_width("％"), 2);
+        // Box-drawing, bar glyphs, and PUA nerd icons stay single-width.
+        assert_eq!(visible_width("█░"), 2);
+        assert_eq!(visible_width("─╭╮"), 3);
+        assert_eq!(visible_width("\u{f06a}"), 1);
+    }
+
+    /// Wide-glyph counting must not disturb the markup-depth and entity
+    /// handling (escaped `<b>` is literal text; `&amp;` stays one glyph).
+    #[test]
+    fn visible_width_handles_markup_and_cjk_mixed() {
+        assert_eq!(visible_width("<span foreground='#fff'>你好</span>"), 4);
+        assert_eq!(visible_width(escape("配置 <b>失败</b>").as_str()), 16);
+        assert_eq!(visible_width("好&amp;好"), 5);
     }
 }

@@ -4,13 +4,13 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::countdown;
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, updated_at_hm};
 use crate::pacing::PaceSeverity;
-use crate::pango::{color_span, escape, severity_color, severity_for};
+use crate::pango::{escape, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
-use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
-use crate::waybar::{Class, WaybarOutput};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome, render_shell};
+use crate::waybar::WaybarOutput;
 
 use super::fetch::FetchOutcome;
 use super::types::{Usage, Window};
@@ -134,29 +134,15 @@ fn render_with_meta(
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> WaybarOutput {
-    let sev = severity(snap);
-    let format = opts.format.as_deref().unwrap_or(DEFAULT_FORMAT);
-    let values = escaped_placeholders(snap, now);
-    let mut text = substitute(format, &values);
-    if stale {
-        text.push_str(" ⏸");
-    }
-    let icon_prefix = match opts.icon.as_deref() {
-        Some(icon) if !icon.is_empty() => format!("{} ", escape(icon)),
-        _ => String::new(),
-    };
-    let bar_text = color_span(severity_color(sev, theme), &format!("{icon_prefix}{text}"));
-    let tooltip = opts
-        .tooltip_format
-        .as_deref()
-        .map(|format| substitute(format, &values))
-        .unwrap_or_else(|| render_tooltip(snap, stale, last_error, cache_age, theme, now));
-
-    WaybarOutput {
-        text: bar_text,
-        tooltip,
-        class: Class::from(sev),
-    }
+    render_shell(
+        DEFAULT_FORMAT,
+        &escaped_placeholders(snap, now),
+        opts,
+        stale,
+        Some(severity(snap)),
+        theme,
+        render_tooltip(snap, stale, last_error, cache_age, theme, now),
+    )
 }
 
 fn escaped_placeholders(usage: &Usage, now: DateTime<Utc>) -> HashMap<&'static str, String> {

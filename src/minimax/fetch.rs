@@ -9,8 +9,9 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch;
 use crate::usage::{MinimaxSnapshot, UsageWindow};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
@@ -18,8 +19,6 @@ use super::types::{RemainsEnvelope, is_auth_failure, to_snapshot};
 
 pub const BASE_GLOBAL: &str = "https://api.minimax.io";
 pub const BASE_CN: &str = "https://api.minimaxi.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Label shown as the plan name. The quota endpoint doesn't name the plan, and
 /// inventing a tier from the numbers would be a guess, so the product name is
@@ -53,13 +52,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: MinimaxSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = fetch::FetchOutcome<MinimaxSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -68,42 +61,22 @@ pub async fn fetch_snapshot(
     endpoints: &Endpoints,
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     let target = target_key(endpoints, api_key);
-
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, &target)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, api_key).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(
-                &serde_json::json!({ "target": target, "snapshot": serde_repr(&snap) }),
-            )?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), &target, e)
-        }
-    }
+    fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        fetch_live(client, endpoints, api_key),
+        |payload| parse_cache(payload.as_bytes(), &target).ok(),
+        |snap| {
+            serde_json::to_string(&serde_json::json!({
+                "target": target,
+                "snapshot": serde_repr(snap),
+            }))
+            .unwrap_or_default()
+        },
+    )
+    .await
 }
 
 /// Identity of the account and instance the cached quota belongs to. Global
@@ -115,42 +88,6 @@ fn target_key(endpoints: &Endpoints, api_key: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     api_key.hash(&mut hasher);
     format!("{}|key:{:016x}", endpoints.remains, hasher.finish())
-}
-
-fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
-    let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
 }
 
 fn window_repr(w: &UsageWindow) -> serde_json::Value {
@@ -231,7 +168,7 @@ async fn fetch_live(
     api_key: &str,
 ) -> Result<MinimaxSnapshot> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(&endpoints.remains)
             .header("Authorization", format!("Bearer {api_key}"))

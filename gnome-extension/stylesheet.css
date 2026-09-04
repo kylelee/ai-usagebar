@@ -29,3 +29,111 @@
     font-size: 0.85em;
     color: #888888;
 }
+
+/* Report popup rows (the `usage --json` projection). The bar's full
+   tile/alarm class set arrives with the tiled bar; these names stay
+   extensible so it can build on them. */
+.aiub-entry-sub {
+    font-size: 0.9em;
+    color: #888888;
+}
+
+/* Remaining-band colors, shared by metric values and meter fills. */
+.aiub-band-low { color: #98c379; }
+.aiub-band-mid { color: #e5c07b; }
+.aiub-band-high { color: #d08770; }
+.aiub-band-critical { color: #e06c75; }
+
+.aiub-metric-value {
+    font-weight: bold;
+}
+
+/* Meter: fixed-width track with a dynamic fill; widths are set as actor
+   geometry in extension.js, colors only here. */
+.aiub-meter-track {
+    height: 8px;
+    border-radius: 4px;
+    background-color: #3e4451;
+}
+
+.aiub-meter-fill {
+    height: 8px;
+    border-radius: 4px;
+    background-color: #abb2bf;
+}
+
+.aiub-meter-fill.aiub-band-low { background-color: #98c379; }
+.aiub-meter-fill.aiub-band-mid { background-color: #e5c07b; }
+.aiub-meter-fill.aiub-band-high { background-color: #d08770; }
+.aiub-meter-fill.aiub-band-critical { background-color: #e06c75; }
+
+.aiub-detail {
+    font-size: 0.9em;
+    color: #888888;
+}
+
+/* Calm rows: subtitles, remedies, footers. Unconfigured accounts never use
+   .aiub-error — a routine missing key is not an alarm. */
+.aiub-note {
+    color: #888888;
+}
+
+.aiub-error {
+    color: #e06c75;
+}
+
+.aiub-spacer {
+    height: 6px;
+}
+
+/* Vendor tab row (the omarchy panel's tabs): one pill toggle per reading
+   vendor; the active tab fills and bolds. The gear at the row's right end
+   opens Preferences (Accounts = key settings). */
+.aiub-tab {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.95em;
+}
+
+.aiub-tab-active {
+    font-weight: bold;
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.aiub-tab-gear {
+    padding: 3px 6px;
+    border-radius: 6px;
+}
+
+/* Tiled bar: per-account tiles joined by the dim │ separator labels. */
+.aiub-tile-label {
+    font-feature-settings: "tnum";
+}
+
+.aiub-tile-sep {
+    color: #888888;
+}
+
+/* Omarchy-style backdrop plate behind the tile row: the same translucent
+   rounded plate the QML BarWidget draws around its label row (background
+   at 62% alpha, 1px foreground-alpha border) so the tiles stay legible
+   over any panel, tiles reading as one grouped pill. */
+.aiub-tile-plate {
+    background-color: rgba(40, 44, 52, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 4px;
+    padding: 3px;
+}
+
+/* Alarming state. Only uncolored spans (the neutral account tag, the
+   loading ellipsis) inherit this — figure spans carry their own Pango
+   band colors and stay per-figure even while alarming. */
+.aiub-alarm {
+    color: #e06c75;
+}
+
+/* Robot-only states (tiling off, loading, nothing tileable): breathing
+   room so the glyph does not hug its panel neighbors. */
+.aiub-robot {
+    padding: 0 2px;
+}

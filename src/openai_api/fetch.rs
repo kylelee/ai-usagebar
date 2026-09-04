@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
 use crate::usage::finite_amount;
 
@@ -20,8 +20,6 @@ pub const BASE_URL: &str = "https://api.openai.com";
 /// Days of billed history to sum — a rolling month, matching the period the
 /// platform dashboard shows by default.
 pub const WINDOW_DAYS: i64 = 30;
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// 30 day-buckets × every line item is a few hundred rows; 6 pages of 100
 /// covers it while bounding a runaway cursor loop.
 const MAX_PAGES: usize = 6;
@@ -40,13 +38,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: crate::usage::OpenAiApiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<crate::usage::OpenAiApiSnapshot>;
 
 /// The aggregate carried out of one (or a cached) fetch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -95,7 +87,16 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
     limit: Option<f64>,
 ) -> Result<FetchOutcome> {
-    fetch_snapshot_at(client, admin_key, cache, endpoints, cache_ttl, limit, Utc::now()).await
+    fetch_snapshot_at(
+        client,
+        admin_key,
+        cache,
+        endpoints,
+        cache_ttl,
+        limit,
+        Utc::now(),
+    )
+    .await
 }
 
 pub async fn fetch_snapshot_at(
@@ -108,52 +109,57 @@ pub async fn fetch_snapshot_at(
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
     let limit = validate_limit(limit)?;
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     let start = window_start(now);
     let target = target_key(admin_key);
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, limit, start, &target)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, admin_key, start).await {
-        Ok(aggregate) => {
-            let bytes = serde_json::to_vec(&serde_json::json!({
+    // Lock / TTL / fallback shell is the shared pipeline; the closures keep
+    // this vendor's payload envelope (window start + key fingerprint +
+    // aggregate) and its current-config limit rule below.
+    crate::fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(crate::fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        async {
+            fetch_live(client, endpoints, admin_key, start)
+                .await
+                .map(|aggregate| snapshot_of(aggregate, limit))
+        },
+        // The limit always comes from the current config, so editing it takes
+        // effect without a refetch.
+        |text| {
+            parse_cached_aggregate(text, start, &target)
+                .map(|aggregate| snapshot_of(aggregate, limit))
+        },
+        |snap| {
+            serde_json::json!({
                 "start": start,
                 "target": target,
-                "aggregate": aggregate,
-            }))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snapshot_of(aggregate, limit),
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
+                "aggregate": CostAggregate {
+                    spent: snap.spent,
+                    by_day: snap.by_day.clone(),
+                    top_items: snap.top_items.clone(),
+                },
             })
-        }
-        Err(e) if e.is_transient() => fallback(cache, None, limit, start, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback(
-                cache,
-                Some(diag),
-                limit,
-                start,
-                &target,
-                AppError::Http { status, body },
-            )
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback(cache, Some(diag), limit, start, &target, e)
-        }
+            .to_string()
+        },
+    )
+    .await
+}
+
+/// Parse the cached envelope back into its aggregate, checking the window and
+/// Admin-key identities first: a payload written for an earlier `start` is a
+/// DIFFERENT window, not a stale version of this one.
+fn parse_cached_aggregate(text: &str, start: i64, target: &str) -> Option<CostAggregate> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("start").and_then(serde_json::Value::as_i64) != Some(start) {
+        return None;
     }
+    if v.get("target").and_then(serde_json::Value::as_str) != Some(target) {
+        return None;
+    }
+    let aggregate: CostAggregate = serde_json::from_value(v.get("aggregate").cloned()?).ok()?;
+    finite_amount("openai-api cache", "spent", aggregate.spent).ok()?;
+    Some(aggregate)
 }
 
 fn snapshot_of(aggregate: CostAggregate, limit: Option<f64>) -> crate::usage::OpenAiApiSnapshot {
@@ -163,64 +169,6 @@ fn snapshot_of(aggregate: CostAggregate, limit: Option<f64>) -> crate::usage::Op
         top_items: aggregate.top_items,
         limit,
     }
-}
-
-/// On failure, serve the last good aggregate with the error alongside it;
-/// with nothing usable cached the ORIGINAL error reaches the caller, so a
-/// first-run 401/403 keeps its Admin-key guidance.
-fn fallback(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    limit: Option<f64>,
-    start: i64,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // The limit always comes from the current config, so editing it takes
-    // effect without a refetch.
-    match reuse_cache(&bytes, cache, true, limit, start, target) {
-        Ok(mut outcome) => {
-            outcome.last_error = last_error;
-            Ok(outcome)
-        }
-        Err(_) => Err(original),
-    }
-}
-
-fn reuse_cache(
-    bytes: &[u8],
-    cache: &Cache,
-    stale: bool,
-    limit: Option<f64>,
-    start: i64,
-    target: &str,
-) -> Result<FetchOutcome> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)?;
-    if v.get("start").and_then(serde_json::Value::as_i64) != Some(start) {
-        return Err(AppError::Schema(
-            "openai-api cache is for a different window; refetching".into(),
-        ));
-    }
-    if v.get("target").and_then(serde_json::Value::as_str) != Some(target) {
-        return Err(AppError::Schema(
-            "openai-api cache belongs to a different Admin key; refetching".into(),
-        ));
-    }
-    let aggregate: CostAggregate = serde_json::from_value(
-        v.get("aggregate")
-            .cloned()
-            .ok_or_else(|| AppError::Schema("openai-api cache missing 'aggregate'".into()))?,
-    )?;
-    finite_amount("openai-api cache", "spent", aggregate.spent)?;
-    Ok(FetchOutcome {
-        snapshot: snapshot_of(aggregate, limit),
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
 }
 
 async fn fetch_live(
@@ -247,11 +195,12 @@ async fn fetch_live(
             req = req.query(&[("page", p.as_str())]);
         }
 
-        let resp = tokio::time::timeout(HTTP_TIMEOUT, req.send())
-            .await
-            .map_err(|_| {
-                AppError::Transport(format!("openai-api timeout: {}", endpoints.costs))
-            })??;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(crate::fetch::HTTP_TIMEOUT_ADMIN_API_SECS),
+            req.send(),
+        )
+        .await
+        .map_err(|_| AppError::Transport(format!("openai-api timeout: {}", endpoints.costs)))??;
 
         let status = resp.status();
         let bytes = crate::vendor::read_body_capped(resp, crate::vendor::MAX_BODY_BYTES).await?;
@@ -319,12 +268,11 @@ fn absorb(page: &CostsPage, aggregate: &mut CostAggregate) -> Result<()> {
             continue;
         }
         let value = crate::usage::finite_amount("openai-api", "costs amount", value)?;
-        let Some(date) = bucket_date(row.start_time) else { continue };
-        aggregate.spent = finite_amount(
-            "openai-api",
-            "costs running total",
-            aggregate.spent + value,
-        )?;
+        let Some(date) = bucket_date(row.start_time) else {
+            continue;
+        };
+        aggregate.spent =
+            finite_amount("openai-api", "costs running total", aggregate.spent + value)?;
         let item = row
             .line_item
             .as_ref()
@@ -383,8 +331,16 @@ mod tests {
         let mut aggregate = CostAggregate::default();
         absorb(&page, &mut aggregate).unwrap();
         finalize(&mut aggregate).unwrap();
-        assert!((aggregate.spent - 6.5).abs() < 1e-9, "{:?}", aggregate.spent);
-        assert_eq!(aggregate.by_day.len(), 3, "EUR and null-amount rows skipped");
+        assert!(
+            (aggregate.spent - 6.5).abs() < 1e-9,
+            "{:?}",
+            aggregate.spent
+        );
+        assert_eq!(
+            aggregate.by_day.len(),
+            3,
+            "EUR and null-amount rows skipped"
+        );
         // Null line items bucket under "other"; gpt-5.2 leads by spend.
         assert_eq!(aggregate.top_items[0].0, "gpt-5.2");
         assert!((aggregate.top_items[0].1 - 3.5).abs() < 1e-9);

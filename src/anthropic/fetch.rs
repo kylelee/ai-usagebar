@@ -1,3 +1,13 @@
+//! Deliberately NOT on `crate::fetch::run_cached_fetch` (todo 14 documented
+//! exception, per the todo-13 STOP criterion): a second credential-scoped
+//! flock is held from the cache lock through `creds::resolve` and the refresh
+//! write-back (desktop account switching), the cache payload is the RAW
+//! upstream body rather than a snapshot projection (a `to_json(&snapshot)`
+//! closure cannot reproduce it), and the refresh state machine interleaves
+//! cache-marker writes with its own fallback policy (no stale marker, its own
+//! surfaced Credentials/Transport texts) — the todo-7 scaffold has no hook
+//! for any of these, so migrating would change observable behavior.
+//!
 //! Stitches together: read creds → maybe-refresh → GET usage → cache result.
 //!
 //! Mirrors claudebar:402-491 — the lock + refresh + fetch state machine.

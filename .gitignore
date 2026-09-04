@@ -9,6 +9,7 @@
 
 # Open Code
 .opencode
+.omo
 
 # Local secrets — never commit
 .env

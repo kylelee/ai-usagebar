@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, MAX_STALE};
 use crate::error::{AppError, Result};
 use crate::usage::KimiSnapshot;
 
@@ -17,9 +17,7 @@ use super::oauth::{self, Region};
 use super::types::{UsagesResponse, UserInfoResponse, humanize_membership_level};
 
 pub const BASE_URL: &str = "https://api.kimi.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Stable marker stored alongside code 0 for a successful HTTP response whose
 /// payload no longer matches Kimi's undocumented usage schema.
 pub const SCHEMA_DRIFT_MESSAGE: &str = "Kimi API schema drift";
@@ -87,13 +85,7 @@ impl KimiCodeAuth {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: KimiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<KimiSnapshot>;
 
 /// API-key fetch. Kept as-is for existing callers; the OAuth path goes
 /// through [`fetch_snapshot_with_auth`].
@@ -134,86 +126,62 @@ async fn fetch_snapshot_at(
     cache_ttl: Duration,
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
+    // Releases before the profile lookup cached `/usages`' internal enum
+    // verbatim. Do not let a still-fresh legacy entry postpone `/me` until the
+    // normal TTL expires: refresh it once and replace it with Kimi's own tier
+    // name. If the network is down, the fallback path still serves the quota
+    // after humanizing the enum.
+    let ttl = if cache
+        .fresh_payload(cache_ttl)?
+        .is_some_and(|bytes| cache_has_legacy_plan(&bytes))
+    {
+        // A zero TTL never counts as fresh, so the shared pipeline takes the
+        // live path and `/me` upgrades the entry this run.
+        Duration::ZERO
+    } else {
+        cache_ttl
+    };
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)? {
-        // Releases before the profile lookup cached `/usages`' internal enum
-        // verbatim. Do not let a still-fresh legacy entry postpone `/me` until
-        // the normal TTL expires: refresh it once and replace it with Kimi's
-        // own tier name. If the network is down, the fallback path below still
-        // serves the quota after humanizing the enum.
-        if !cache_has_legacy_plan(&bytes)
-            && let Ok(outcome) = reuse_cache(bytes, cache, false)
-        {
-            return Ok(outcome);
-        }
-    }
-    // Corrupt fresh cache: fall through to live fetch rather than return a
-    // fabricated zero snapshot.
-
-    match fetch_live(client, endpoints, auth, now).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, e),
-        Err(e) => {
-            cache.mark_stale();
-            if let Some((code, msg)) = error_to_pair(&e) {
-                cache.write_last_error(code, &msg);
+    // Lock / TTL / fallback shell is the shared pipeline; the closures keep
+    // this vendor's snapshot payload and its diagnostic-pair rules below.
+    crate::fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(crate::fetch::LOCK_TIMEOUT_SECS),
+        ttl,
+        async {
+            match fetch_live(client, endpoints, auth, now).await {
+                Ok(snap) => Ok(snap),
+                // A schema-drift failure that will be served from the cache is
+                // recorded under the stable `SCHEMA_DRIFT_MESSAGE` marker (what
+                // `warning_kind` labels as drift), not the full schema text —
+                // so the shared non-transient arm persists kimi's exact pair.
+                // With no usable cache the ORIGINAL schema error must surface
+                // with its parse detail, hence the condition.
+                Err(AppError::Schema(_)) if cache.fallback_payload(MAX_STALE)?.is_some() => {
+                    Err(AppError::Other(SCHEMA_DRIFT_MESSAGE.into()))
+                }
+                Err(e) => Err(e),
             }
-            fallback_with_error(cache, e)
-        }
-    }
+        },
+        |text| parse_cache(text.as_bytes()).ok(),
+        |snap| snap_to_json(snap).to_string(),
+    )
+    .await
+    .map(apply_error_pair)
 }
 
-fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(bytes, cache, true) {
-        Ok(outcome) => Ok(outcome),
-        Err(_) => Err(original),
+/// Re-apply kimi's diagnostic pair on a served-stale outcome: the shared
+/// failure arms report the cache-level `AUTH_FAILURE_MESSAGE` for 401/403,
+/// while kimi's own policy (and `fetch_live`, which never lets a raw auth
+/// body through) uses its fixed string for those codes.
+fn apply_error_pair(mut outcome: FetchOutcome) -> FetchOutcome {
+    if let Some((code, msg)) = &outcome.last_error
+        && matches!(code, 401 | 403)
+        && msg == crate::error::AUTH_FAILURE_MESSAGE
+    {
+        outcome.last_error = Some((*code, "Kimi authentication failed".into()));
     }
-}
-
-fn fallback_with_error(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(bytes, cache, true) {
-        Ok(mut outcome) => {
-            outcome.last_error = error_to_pair(&original);
-            Ok(outcome)
-        }
-        Err(_) => Err(original),
-    }
-}
-
-fn error_to_pair(e: &AppError) -> Option<(u16, String)> {
-    match e {
-        AppError::Http { status, body } => Some((*status, body.clone())),
-        // A 2xx response with an unknown shape is not an HTTP 422 response.
-        AppError::Schema(_) => Some((0, SCHEMA_DRIFT_MESSAGE.into())),
-        e => Some((0, e.to_string())),
-    }
-}
-
-fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
-    let snap = parse_cache(&bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    outcome
 }
 
 fn parse_cache(bytes: &[u8]) -> Result<KimiSnapshot> {
@@ -343,7 +311,7 @@ async fn bearer_token(
 /// error text) to 404 for accounts without a coding profile.
 async fn plan_label(client: &reqwest::Client, url: &str, token: &str) -> Option<String> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(crate::fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(url)
             .header("Authorization", format!("Bearer {token}"))
@@ -377,7 +345,7 @@ async fn fetch_live(
     // latency, not two.
     let (usages, label) = tokio::join!(
         tokio::time::timeout(
-            HTTP_TIMEOUT,
+            Duration::from_secs(crate::fetch::HTTP_TIMEOUT_DEFAULT_SECS),
             client
                 .get(url)
                 .header("Authorization", format!("Bearer {token}"))

@@ -18,6 +18,15 @@ settings.
 #                         # | novita | moonshot | grok | supergrok | antigravity
 #                         # | cursor | minimax | kiro | opencode-go
 
+# Which vendors the Overview lists (the TUI's first tab / the macOS menu-bar's
+# top section), in this order. Omit for every enabled vendor.
+# overview_vendors = ["anthropic", "cursor", "openai"]
+
+# Presentation of vendor tab navigation: sidebar (vertical box) | navbar
+# (top strip) | none (hidden). Default sidebar (falls back to navbar on
+# narrow terminals).
+# vendor_box = "sidebar"
+
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-omarchy-tui
 # projects_path = "~/.claude/projects"
@@ -76,8 +85,9 @@ enabled = true
 
 # show_default_account = false  # hide default when named accounts exist
 
+# Extra OpenRouter keys — auto-named 1, 2, … by position, no label field
+# (see the OpenRouter account guide below).
 # [[openrouter.accounts]]
-# label = "work"
 # api_key = "paste-your-key-here"
 
 [deepseek]
@@ -175,7 +185,9 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 # db_path = "/home/you/.local/share/kiro-cli/data.sqlite3"
 ```
 
-For more than one OpenRouter key, see the
+For more than one OpenRouter key, add `[[openrouter.accounts]]` entries —
+each is auto-named 1, 2, … by its position in the list, so there is no
+label to configure. See the
 [OpenRouter account guide](openrouter-accounts.md). The existing singular
 `[openrouter]` key remains the default account and needs no migration.
 
@@ -247,12 +259,34 @@ legacy hand-written labels are ignored (positional naming owns it now).
 
 ## Seeing every account at once
 
-Two ways to tile all accounts in one bar, the way the old GNOME panel did:
+Three ways to tile all accounts in one bar:
 
 - Omarchy Quattro panel: on by default — every working account appears side
   by side, each tile led by its provider logo (`claude 42% 5.3h │ kimi 18% 1d`);
   there is no module icon in front of the tiles. Toggle **Tile every account
   in the top bar** off for the opposite minimalism: the robot icon alone,
   with the numbers one hover or click away.
+- GNOME Shell extension: on by default since the v3 rewrite. Every working
+  account appears side by side, each tile led by its provider logo; toggle
+  **Tile accounts** off for the selected account alone.
 - Waybar: run the widget with `--vendor all` for the same tiling, with a
   combined hover tooltip covering every account.
+
+### macOS menu-bar overview caps
+
+On macOS, the menu-bar app can tile the same overview in the status bar
+itself — one mini bar per vendor while they fit, plain `name pct` numbers
+once they would not. Two `[ui]` keys tune the switch points:
+
+```toml
+[ui]
+# Show mini bars only while the overview has at most this many entries;
+# beyond it the menu bar falls back to plain numbers. Default 4.
+# overview_menubar_bars_max = 4
+# How many plain numbers the compact overview shows before a `+K`
+# overflow marker. Default 4.
+# overview_menubar_max = 4
+```
+
+These are read by the macOS menu-bar app directly; the other frontends
+(Rust widget, TUI, Omarchy, the GNOME extension, KDE) ignore them.

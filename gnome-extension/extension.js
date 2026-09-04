@@ -1,11 +1,21 @@
-// AI Usage Bar — GNOME Shell indicator that renders ai-usagebar's
-// 5-hour (session), weekly, and (optionally) extra-usage bars in the top
-// panel next to the clock/network, with a native, aligned dropdown.
+// AI Usage Bar — GNOME Shell indicator backed by the `usage --json` report.
 //
-// It shells out to the `ai-usagebar` binary (always exits 0, emits Waybar
-// JSON `{text, tooltip, class}`) and draws everything with native St
-// widgets. Bar colors and thresholds default to the binary's One Dark
-// theme but are user-configurable.
+// The popup tiles ONE TAB PER KEY (account), sorted by vendor & key: each
+// tab carries that account's full report rows (header, metric rows with
+// band-colored values and meters, live reset countdowns on a 30s ticker,
+// text/block rows), an updated-at footer rides below, and a gear button
+// in the tab row opens Preferences (its Accounts page manages keys).
+// Unconfigured vendors render nothing — only the fresh-install CTA shows
+// on an all-unconfigured report — while configured-but-broken accounts
+// keep one calm error row below the tabs. The bar button tiles every
+// working account: ONE label per tile whose Pango markup colors each
+// figure by its own remaining band, a vendor logo when the asset ships,
+// wheel/middle-click selection cycling with a persisted choice. Tiling
+// off, loading, and nothing-tileable states collapse to the robot icon
+// alone.
+//
+// This file is shell glue only: report parsing and message shaping live in
+// report-model.js, binary lookup and spawning in subprocess-utils.js.
 
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -13,189 +23,710 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 
-import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
-    isGrouped, markerElapsed, plainTextFromPango, selectPools,
-    splitFormatOutput} from './marker-logic.js';
+
+import {resolveBinary, runJson} from './subprocess-utils.js';
+import {
+    accountTabs,
+    barTileEntries,
+    baseProvider,
+    errorMessage,
+    filteredEntries,
+    formatReset,
+    formatUpdated,
+    isAlarming,
+    launchErrorMessage,
+    logoAssetName,
+    metricDetail,
+    parseReport,
+    preferredEntryId,
+    providerEntryCounts,
+    providerName,
+    selectedIndex,
+    tileParts,
+    tileTag,
+    windowClass,
+    worstBand,
+} from './report-model.js';
 
 const ROLE = 'ai-usagebar';
 
-// Fixed accent colors (tags / dim text). Bar colors are user-configurable.
-const DIM = '#5c6370';
-const FG = '#abb2bf';
-const RED = '#e06c75';
-// FORMAT's final ignored literal sentinel receives a stale suffix, keeping the
-// preceding elapsed fields numeric. It and its field indexes live in marker-logic.
+// Force-exit bound for one usage fetch; runJson owns the actual timer.
 const REFRESH_TIMEOUT_SECS = 60;
-
-function esc(s) {
-    return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
-function resolveBinary(settings) {
-    const configured = settings.get_string('binary-path');
-    if (configured && GLib.file_test(configured, GLib.FileTest.IS_EXECUTABLE))
-        return configured;
-    // The canonical name first; the legacy short name still resolves on AUR
-    // installs, which ship a compatibility symlink.
-    for (const name of ['ai-usagebar-omarchy', 'ai-usagebar']) {
-        const onPath = GLib.find_program_in_path(name);
-        if (onPath)
-            return onPath;
-        const cargo = `${GLib.get_home_dir()}/.cargo/bin/${name}`;
-        if (GLib.file_test(cargo, GLib.FileTest.IS_EXECUTABLE))
-            return cargo;
-    }
-    return 'ai-usagebar-omarchy';
-}
+// Countdown/footer cadence between network refreshes (Panel.qml's 30s timer).
+const TICKER_SECS = 30;
+// Meter geometry: a fixed track; the fill width is computed per percent.
+const METER_TRACK_PX = 240;
 
 const Indicator = GObject.registerClass(
 class AiUsageBarIndicator extends PanelMenu.Button {
-    _init(settings, openPrefs) {
+    _init(settings, openPrefs, iconFile, logosDir) {
         super._init(0.0, 'AI Usage Bar', false);
 
         this._settings = settings;
         this._openPrefs = openPrefs;
-        this._data = null;          // parsed snapshot for redraws
+        // Async callbacks (the runJson promise, the ticker) never touch a
+        // destroyed indicator's actors.
+        this._destroyed = false;
+        this._report = null;          // last parsed usage report
+        this._reportError = '';       // refresh failure shown above the rows
         this._busy = false;
         // A refresh asked for while one was in flight, to run once it settles.
         this._refreshPending = false;
-        this._timer = 0;
-        this._refreshTimeoutId = 0;
-        this._refreshCancellable = null;
-        this._refreshProc = null;
         this._refreshToken = 0;
-        this._rows = {};
+        this._refreshCancellable = null;
+        this._timer = 0;
+        this._tickerId = 0;
+        this._lastSuccessfulMs = 0;
+        this._nowMs = Date.now();
+        // Countdown-dependent labels, refreshed in place by the ticker.
+        this._countdowns = [];
+        this._footerLabel = null;
+        this._footerFetchedAt = '';
 
-        // Panel: one markup label holds tags + percentages + bars.
-        this._label = new St.Label({
-            text: '5h …',
+        // The tiled bar: one tile per working, non-exhausted account. Actors
+        // are rebuilt only when the tile entry-id set changes; figures,
+        // colors, and countdowns are in-place markup updates.
+        this._selectedEntryId = '';
+        this._tiles = [];
+        this._tileKey = '';
+        this._logosDir = logosDir;
+
+        this._barBox = new St.BoxLayout({style: 'spacing: 4px;'});
+        this._robotIcon = new St.Icon({
+            // Gio.FileIcon has no new_for_file static in newer GJS — constructor form only.
+            gicon: new Gio.FileIcon({file: iconFile}),
+            icon_size: 16,
             y_align: Clutter.ActorAlign.CENTER,
-            style_class: 'aiub-label',
+            style_class: 'aiub-robot',
         });
-        this.add_child(this._label);
+        this._robotLabel = new St.Label({
+            text: '…',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        // 2px: omarchy's tile density — its │ separator carries only ~2px
+        // pads each side, so tiles read as one tight group inside the plate.
+        this._tileBox = new St.BoxLayout({style: 'spacing: 2px;'});
+        this._barBox.add_child(this._robotIcon);
+        this._barBox.add_child(this._robotLabel);
+        this._barBox.add_child(this._tileBox);
+        this.add_child(this._barBox);
 
         this._buildMenu();
-
-        // Re-render cached data when any display setting changes (no refetch).
-        const viewKeys = [
-            'bar-width', 'show-percent', 'show-bars', 'show-session',
-            'show-weekly', 'show-extra', 'color-low', 'color-mid',
-            'color-high', 'color-critical', 'color-empty',
-            'panel-pools', 'panel-auto-threshold',
-        ];
-        this._viewIds = viewKeys.map(k =>
-            this._settings.connect(`changed::${k}`, () => this._render()));
 
         this._intervalId = this._settings.connect('changed::refresh-interval',
             () => this._restartTimer());
         this._sourceIds = [
-            this._settings.connect('changed::vendor', () => this._refresh()),
+            // The whole report is always fetched; the vendor key only filters
+            // which entries render, so a change re-renders, never refetches.
+            this._settings.connect('changed::vendor', () => this._buildMenu()),
             this._settings.connect('changed::binary-path', () => this._refresh()),
+            // Preferences bump config-rev after every successful settings
+            // apply; the new configuration deserves a fresh fetch.
+            this._settings.connect('changed::config-rev', () => this._refresh()),
+            // Display toggles re-render the bar in place; no refetch needed.
+            this._settings.connect('changed::show-remaining', () => this._updateBar()),
+            this._settings.connect('changed::bar-tiled', () => this._updateBar()),
+            this._settings.connect('changed::show-logos', () => this._updateBar()),
         ];
 
+        // Wheel cycles the account selection; middle click advances it. The
+        // base PanelMenu.Button connected first, so its native primary-click
+        // menu toggle runs before these — only button 2 is intercepted, and
+        // right-click deliberately has no handler at all.
+        this.connect('scroll-event', (_actor, event) => this._onScroll(event));
+        this.connect('button-press-event', (_actor, event) => this._onButtonPress(event));
+
         this.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
+            if (!open)
+                return;
+            this._nowMs = Date.now();
+            this._onTick();
+            // Refresh on open only when the data is older than the interval
+            // (the QML panel's staleness rule).
+            if (this._lastSuccessfulMs === 0 ||
+                    this._nowMs - this._lastSuccessfulMs >= this._intervalSeconds() * 1000)
                 this._refresh();
         });
 
         this._refresh();
         this._restartTimer();
+        this._startTicker();
     }
 
-    _buildMenu(grouped = false) {
-        this.menu.removeAll();
-        this._rows = {};
-        this._grouped = grouped;
+    // The vendor key is a display filter over the whole report: '' = every
+    // account, a slug = that vendor's accounts, an exact id = one account.
+    _visibleEntries(report = this._report) {
+        return report ? filteredEntries(report.entries, this._settings.get_string('vendor')) : [];
+    }
 
-        // Header (plan name).
-        const header = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        this._planLabel = new St.Label({text: 'AI Usage', x_expand: true, style_class: 'aiub-header'});
-        header.add_child(this._planLabel);
-        this.menu.addMenuItem(header);
+    _intervalSeconds() {
+        // GSettings already ranges 30–3600; clamping mirrors the QML panel
+        // and keeps values from before the range existed honest.
+        return Math.max(30, Math.min(3600, this._settings.get_int('refresh-interval')));
+    }
 
-        if (grouped) {
-            // Two independent quota pools per window type. Row order changes,
-            // but the data mapping does not: session/weekly still hold the
-            // primary pool, so the panel bar and the show-session/show-weekly
-            // toggles keep working exactly as they do for every other vendor.
-            this._addHeading('Session');
-            this._addRow('session', 'Session');
-            this._addRow('sonnet', 'Sonnet only');
-            this._addHeading('Weekly');
-            this._addRow('weekly', 'Weekly');
-            this._addRow('extra', 'Extra usage');
-        } else {
-            this._addRow('session', 'Session');
-            this._addRow('weekly', 'Weekly');
-            this._addRow('sonnet', 'Sonnet only');
-            this._addRow('extra', 'Extra usage');
+    // Selection: keep the current entry while it stays visible, else fall
+    // back to the remembered choice, then the report's primary, then the
+    // first working account (Panel.qml's syncSelection rule).
+    _syncSelection(visible) {
+        if (visible.length === 0) {
+            this._selectedEntryId = '';
+            return;
         }
+        if (selectedIndex(visible, this._selectedEntryId) >= 0)
+            return;
+        this._selectedEntryId = preferredEntryId(visible,
+            this._report ? this._report.primary : '',
+            this._settings.get_string('last-selected-entry'));
+    }
+
+    // Tiles when tiling is on and at least one account is tileable; the
+    // robot icon alone otherwise (tiling off, loading, or every account
+    // exhausted/broken/unconfigured). The robot glyph never changes
+    // appearance — alarms travel through the text color only.
+    _updateBar() {
+        if (this._destroyed)
+            return;
+        const visible = this._visibleEntries();
+        this._syncSelection(visible);
+        const tiled = this._settings.get_boolean('bar-tiled');
+        const tiles = this._report
+            ? barTileEntries(visible, this._selectedEntryId, tiled) : [];
+        const tiledMode = tiled && tiles.length > 0;
+        this._robotIcon.visible = !tiledMode;
+        this._robotLabel.visible = !tiledMode && !this._report && this._busy;
+        this._tileBox.visible = tiledMode;
+        // Omarchy-style backdrop plate: wraps the tile row only, never the
+        // robot-icon fallback states.
+        if (tiledMode)
+            this._tileBox.add_style_class_name('aiub-tile-plate');
+        else
+            this._tileBox.remove_style_class_name('aiub-tile-plate');
+        const alarmClass = this._alarming(visible) ? 'aiub-alarm' : '';
+        if (!tiledMode) {
+            this._robotLabel.style_class = ('aiub-tile-label ' + alarmClass).trim();
+            return;
+        }
+        // Actor churn only when the tile set (or the logo policy) changes;
+        // a recovered or exhausted account reshapes the bar on its next
+        // report, same set → markup-only update.
+        const showLogos = this._settings.get_boolean('show-logos');
+        const key = (showLogos ? 'logos|' : '') + tiles.map(entry => entry.id).join('│');
+        if (key !== this._tileKey) {
+            this._buildTiles(tiles, showLogos);
+            this._tileKey = key;
+        }
+        this._updateTileMarkup(tiles, visible, alarmClass);
+    }
+
+    // One tile = optional logo icon + ONE label whose Pango markup carries
+    // the tag and every figure; dim separator labels ride between tiles.
+    _buildTiles(tiles, showLogos) {
+        this._tileBox.destroy_all_children();
+        this._tiles = [];
+        for (let i = 0; i < tiles.length; i++) {
+            const entry = tiles[i];
+            if (i > 0)
+                this._tileBox.add_child(new St.Label({
+                    text: '│',
+                    y_align: Clutter.ActorAlign.CENTER,
+                    style_class: 'aiub-tile-sep',
+                }));
+            const tile = new St.BoxLayout({style: 'spacing: 4px;'});
+            const asset = showLogos ? logoAssetName(entry.logo) : '';
+            if (asset !== '')
+                tile.add_child(new St.Icon({
+                    gicon: new Gio.FileIcon({file: this._logosDir.get_child(asset)}),
+                    icon_size: 16,
+                    y_align: Clutter.ActorAlign.CENTER,
+                }));
+            const label = new St.Label({y_align: Clutter.ActorAlign.CENTER});
+            tile.add_child(label);
+            this._tileBox.add_child(tile);
+            this._tiles.push({id: entry.id, label});
+        }
+    }
+
+    // The label markup of one tile: the tag stays neutral (theme foreground,
+    // inherited from the label), each figure gets a span in its OWN window's
+    // remaining-band color read live from the color-* keys, and a critical
+    // figure also goes bold so the alert survives color blindness. tileParts
+    // text is pre-escaped by the adapter (autoTextSafe); only '&' — the one
+    // character it does not neutralize — is encoded here, never re-escaped
+    // wholesale (that would show literal entities).
+    _tileMarkup(entry, solo) {
+        const parts = tileParts(entry, true,
+            this._settings.get_boolean('show-remaining'), this._nowMs, solo);
+        if (parts.length === 0)
+            return '';
+        const showLogo = this._settings.get_boolean('show-logos')
+            && logoAssetName(entry.logo) !== '';
+        const hasTag = tileTag(entry) !== '';
+        const segments = [];
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            // Beside a rendered logo only a NAMED account still needs its
+            // distinguishing suffix; a default/solo account is the logo alone.
+            const text = i === 0 && hasTag && showLogo ? part.logoLabel : part.text;
+            if (text === '')
+                continue;
+            const safe = text.replace(/&/g, '&amp;');
+            const body = part.cls === 'critical' ? `<b>${safe}</b>` : safe;
+            const hex = this._bandColor(part.cls);
+            segments.push(hex !== '' ? `<span foreground="${hex}">${body}</span>` : body);
+        }
+        return segments.join(' ');
+    }
+
+    // Band class → color-low/mid/high/critical key, read live so user
+    // overrides land on the next render. A hand-edited dconf value that is
+    // not #rrggbb would poison the markup — degrade to neutral instead.
+    _bandColor(cls) {
+        if (cls === '')
+            return '';
+        const hex = this._settings.get_string(`color-${cls}`);
+        return /^#[0-9a-fA-F]{6}$/.test(hex) ? hex : '';
+    }
+
+    // In-place markup refresh: same actors, new figures/colors/countdowns.
+    _updateTileMarkup(tiles, visible, alarmClass) {
+        const counts = providerEntryCounts(visible);
+        for (let i = 0; i < this._tiles.length && i < tiles.length; i++) {
+            const entry = tiles[i];
+            const solo = counts[baseProvider(entry.id)] <= 1;
+            const label = this._tiles[i].label;
+            label.clutter_text.set_markup(this._tileMarkup(entry, solo));
+            label.style_class = ('aiub-tile-label ' + alarmClass).trim();
+        }
+    }
+
+    // Urgent states: a refresh failure, a vendor filter matching nothing, or
+    // any shown account broken, stale, or critical (worst band included).
+    // Colors the bar text through .aiub-alarm — explicit figure spans keep
+    // their own colors, so only the neutral tag/ellipsis inherits the red.
+    _alarming(visible) {
+        if (this._reportError !== '')
+            return true;
+        if (this._report && visible.length === 0
+                && this._settings.get_string('vendor') !== ''
+                && this._report.entries.length > 0)
+            return true;
+        if (worstBand(visible) === 'critical')
+            return true;
+        for (const entry of visible)
+            if (isAlarming(entry))
+                return true;
+        return false;
+    }
+
+    _onScroll(event) {
+        if (this._destroyed)
+            return Clutter.EVENT_PROPAGATE;
+        const direction = event.get_scroll_direction();
+        let step = 0;
+        if (direction === Clutter.ScrollDirection.UP) {
+            step = -1;
+        } else if (direction === Clutter.ScrollDirection.DOWN) {
+            step = 1;
+        } else if (direction === Clutter.ScrollDirection.SMOOTH) {
+            // Trackpads emit smooth scrolls; the vertical delta carries the
+            // direction.
+            const [, dy] = event.get_scroll_delta();
+            if (dy !== 0)
+                step = dy < 0 ? -1 : 1;
+        }
+        if (step === 0)
+            return Clutter.EVENT_PROPAGATE;
+        this._cycleSelection(step);
+        return Clutter.EVENT_STOP;
+    }
+
+    _onButtonPress(event) {
+        if (this._destroyed)
+            return Clutter.EVENT_PROPAGATE;
+        if (event.get_button() === 2) {
+            this._cycleSelection(1);
+            return Clutter.EVENT_STOP;
+        }
+        // Everything else propagates: primary click keeps the native menu
+        // toggle and right-click stays unhandled.
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    // Cycle over the tileable accounts (ready, non-exhausted) with
+    // wraparound — the same population the bar tiles, so the wheel never
+    // parks the selection on an entry that cannot show.
+    _cycleSelection(step) {
+        const visible = this._visibleEntries();
+        const cycle = this._report
+            ? barTileEntries(visible, this._selectedEntryId, true) : [];
+        if (cycle.length === 0)
+            return;
+        const index = selectedIndex(cycle, this._selectedEntryId);
+        const next = ((index + step) % cycle.length + cycle.length) % cycle.length;
+        this._applySelection(cycle[next].id);
+    }
+
+    _applySelection(entryId) {
+        if (entryId === this._selectedEntryId)
+            return;
+        this._selectedEntryId = entryId;
+        this._settings.set_string('last-selected-entry', entryId);
+        this._updateBar();
+    }
+
+    // The dropdown, synced to the omarchy panel's display logic: a vendor
+    // tab row (one tab per vendor that actually reads, plus the gear that
+    // opens Preferences), the active tab's account sections, calm error
+    // rows for configured-but-broken accounts, and the footer. Full
+    // rebuild only when the report (or the filter) changes; the ticker
+    // updates countdown-dependent labels in place.
+    _buildMenu() {
+        this.menu.removeAll();
+        this._countdowns = [];
+        this._footerLabel = null;
+        this._footerFetchedAt = '';
+
+        const entries = this._visibleEntries();
+
+        if (this._reportError !== '')
+            this._addMessageRow(this._reportError, 'aiub-error');
+
+        if (!this._report && this._busy && this._reportError === '')
+            this._addMessageRow(_('Collecting configured providers…'), 'aiub-note');
+
+        // A vendor filter matching nothing shows its own remedy row; the
+        // fresh-install CTA is computed over the UNFILTERED report so an
+        // empty filtered view can never trigger it.
+        const vendor = this._settings.get_string('vendor');
+        const filterMiss = this._report !== null && vendor !== ''
+            && this._report.entries.length > 0 && entries.length === 0;
+        if (filterMiss)
+            this._addFilterMissRow();
+        else if (this._report
+            && this._report.entries.every(entry => entry.status === 'unconfigured'))
+            this._addCtaRow();
+
+        const tabs = this._report ? accountTabs(entries) : [];
+        if (tabs.length > 0) {
+            this._syncSelection(entries);
+            const active = tabs.find(tab => tab.id === this._selectedEntryId) ?? tabs[0];
+            if (active.id !== this._selectedEntryId)
+                this._applySelection(active.id);
+            this._addTabRow(tabs, active);
+            this._addEntry(active);
+        }
+
+        // Unconfigured vendors render nothing (the user's sync rule — they
+        // have no usage to show); an account whose key EXISTS but errors
+        // keeps one calm row, because hiding a real failure reads as data.
+        for (const entry of entries) {
+            if (entry.status === 'error')
+                this._addRemedyRow(entry);
+        }
+
+        this._addFooter(entries);
+        this._updateBar();
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        const refreshItem = new PopupMenu.PopupMenuItem('Atualizar agora');
+        const refreshItem = new PopupMenu.PopupMenuItem(_('Refresh now'));
         refreshItem.connect('activate', () => this._refresh());
         this.menu.addMenuItem(refreshItem);
 
-        const tuiItem = new PopupMenu.PopupMenuItem('Abrir TUI');
-        tuiItem.connect('activate', () => this._openTui());
-        this.menu.addMenuItem(tuiItem);
-
-        const prefsItem = new PopupMenu.PopupMenuItem('Configurações');
+        const prefsItem = new PopupMenu.PopupMenuItem(_('Preferences'));
         prefsItem.connect('activate', () => this._openPrefs());
         this.menu.addMenuItem(prefsItem);
     }
 
-    // Group subtitle sitting above the rows that belong to it.
-    _addHeading(text) {
+    _rowContainer(children) {
         const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        item.add_child(new St.Label({text, x_expand: true, style_class: 'aiub-header'}));
+        for (const child of children)
+            item.add_child(child);
+        this.menu.addMenuItem(item);
+        return item;
+    }
+
+    _addMessageRow(text, styleClass) {
+        this._rowContainer([new St.Label({text, x_expand: true, style_class: styleClass})]);
+    }
+
+    _addCtaRow() {
+        const item = new PopupMenu.PopupMenuItem(_('No account configured — open Settings…'));
+        item.connect('activate', () => this._openPrefs());
         this.menu.addMenuItem(item);
     }
 
-    // A native, font-independent row: [name ........ value] / bar / reset.
-    _addRow(key, name) {
-        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+    // The vendor filter matched no entry: one calm, actionable row replaces
+    // the misleading "no account configured" CTA in this state.
+    _addFilterMissRow() {
+        const item = new PopupMenu.PopupMenuItem(
+            _('This filter matches no account — clear it in Preferences.'));
+        item.connect('activate', () => this._openPrefs());
+        this.menu.addMenuItem(item);
+    }
+
+    // One toggle per key (account), vendor & key sorted — plus the gear at
+    // the right end: the dropdown's settings entry, opening Preferences
+    // whose Accounts page manages API keys. Selecting a tab persists that
+    // account as the selection (the same last-selected-entry the wheel
+    // cycle writes) and rebuilds the body with that key's usage.
+    _addTabRow(tabs, active) {
+        const box = new St.BoxLayout({style: 'spacing: 4px;', x_expand: true});
+        for (const tab of tabs) {
+            const button = new St.Button({
+                label: providerName(tab),
+                style_class: tab === active
+                    ? 'aiub-tab aiub-tab-active' : 'aiub-tab',
+                can_focus: true,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            button.connect('clicked', () => {
+                if (tab === active)
+                    return;
+                this._applySelection(tab.id);
+                this._buildMenu();
+            });
+            box.add_child(button);
+        }
+        const gear = new St.Button({
+            style_class: 'aiub-tab-gear',
+            can_focus: true,
+            child: new St.Icon({
+                icon_name: 'preferences-system-symbolic',
+                icon_size: 14,
+                y_align: Clutter.ActorAlign.CENTER,
+            }),
+            x_expand: true,
+            x_align: Clutter.ActorAlign.END,
+        });
+        gear.connect('clicked', () => this._openPrefs());
+        box.add_child(gear);
+        this._rowContainer([box]);
+    }
+
+    // A configured-but-broken account keeps ONE calm compact row with its
+    // remedy — a real failure is information, never alarm-colored.
+    _addRemedyRow(entry) {
+        const unconfigured = entry.status === 'unconfigured';
+        const icon = new St.Icon({
+            icon_name: unconfigured ? 'dialog-password-symbolic' : 'dialog-warning-symbolic',
+            icon_size: 16,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: unconfigured ? 'aiub-note' : 'aiub-error',
+        });
+        const name = new St.Label({
+            text: providerName(entry),
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'aiub-row-name',
+        });
+        const remedy = new St.Label({
+            text: entry.error !== '' ? errorMessage(entry.error)
+                : _('Set an API key in Preferences.'),
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'aiub-note',
+        });
+        this._rowContainer([icon, name, remedy]);
+    }
+
+    _addEntry(entry) {
+        // Header: display_name already carries the account suffix exactly
+        // when the provider has siblings (the Rust report owns that rule);
+        // the subtitle is the plan, marked cached when data is stale.
+        const title = new St.Label({
+            text: providerName(entry),
+            x_expand: true,
+            style_class: 'aiub-header',
+        });
+        let subText = entry.plan !== '' ? entry.plan : _('Usage and limits');
+        if (entry.stale)
+            subText += ' · ' + _('cached');
+        this._rowContainer([
+            title,
+            new St.Label({
+                text: subText,
+                y_align: Clutter.ActorAlign.CENTER,
+                style_class: 'aiub-entry-sub',
+            }),
+        ]);
+
+        for (const section of entry.sections) {
+            if (section.type === 'metric')
+                this._addMetricRow(section);
+            else if (section.type === 'text')
+                this._addTextRow(section);
+            else if (section.type === 'block')
+                this._addBlockRow(section);
+            else if (section.type === 'spacer')
+                this._addSpacerRow();
+        }
+    }
+
+    _addMetricRow(section) {
+        // Window rows use the same remaining bands as the bar tiles; other
+        // metrics keep the Rust severity, whose critical still reads urgent.
+        const band = section.window === 'session' || section.window === 'weekly'
+            ? windowClass(section) : '';
+        const critical = section.severity === 'critical' || band === 'critical';
+        const valueClass = band !== ''
+            ? `aiub-band-${band}` : (critical ? 'aiub-band-critical' : '');
+
+        const head = new St.BoxLayout({x_expand: true});
+        // The warning glyph rides the label so the alert survives color
+        // blindness — red alone is not the only channel.
+        head.add_child(new St.Label({
+            text: (critical ? '󰀪 ' : '') + section.label,
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+        head.add_child(new St.Label({
+            text: section.value !== '' ? section.value : `${section.percent}%`,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: ('aiub-metric-value ' + valueClass).trim(),
+        }));
+
+        // Meter: fixed-width horizontal St.BoxLayout track, the fill packed
+        // as its first child — BoxLayout children stack from x=0, so the
+        // progress anchors LEFT by construction and never depends on the
+        // child-alignment semantics of St.Bin/ClutterBinLayout (whose
+        // centered default floated the fill as a stub). Colors come from
+        // stylesheet classes so the tiled bar can extend the same palette.
+        const track = new St.BoxLayout({
+            style_class: 'aiub-meter-track',
+            width: METER_TRACK_PX,
+            x_align: Clutter.ActorAlign.START,
+        });
+        const fillPx = Math.max(0, Math.min(METER_TRACK_PX,
+            Math.round(section.percent * METER_TRACK_PX / 100)));
+        const fill = new St.Bin({
+            style: `width: ${fillPx}px;`,
+            style_class: ('aiub-meter-fill ' + valueClass).trim(),
+        });
+        track.add_child(fill);
+
         const vbox = new St.BoxLayout({
             orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             style_class: 'aiub-row',
         });
-
-        const head = new St.BoxLayout({x_expand: true});
-        const nameL = new St.Label({text: name, x_expand: true, style_class: 'aiub-row-name'});
-        const valL = new St.Label({style_class: 'aiub-row-val'});
-        head.add_child(nameL);
-        head.add_child(valL);
-
-        const barL = new St.Label({style_class: 'aiub-row-bar'});
-        const resetL = new St.Label({style_class: 'aiub-row-reset'});
-
         vbox.add_child(head);
-        vbox.add_child(barL);
-        vbox.add_child(resetL);
-        item.add_child(vbox);
-        this.menu.addMenuItem(item);
+        vbox.add_child(track);
 
-        this._rows[key] = {item, nameL, valL, barL, resetL};
+        const detailText = metricDetail(section);
+        if (detailText !== '')
+            vbox.add_child(new St.Label({text: detailText, style_class: 'aiub-detail'}));
+
+        // Live reset countdown with the local clock and cross-day dating.
+        const reset = new St.Label({style_class: 'aiub-detail'});
+        reset.text = formatReset(section.reset_at, this._nowMs);
+        reset.visible = reset.text !== '';
+        vbox.add_child(reset);
+        if (section.reset_at !== '')
+            this._countdowns.push({label: reset, resetAt: section.reset_at});
+
+        this._rowContainer([vbox]);
     }
 
-    _colors() {
-        const g = k => this._settings.get_string(k);
-        return {
-            low: g('color-low'),
-            mid: g('color-mid'),
-            high: g('color-high'),
-            critical: g('color-critical'),
-            empty: g('color-empty'),
-        };
+    _addTextRow(section) {
+        if (section.value === '') {
+            // Heading: all-caps, like the QML panel's section titles.
+            this._rowContainer([new St.Label({
+                text: section.label.toUpperCase(),
+                x_expand: true,
+                style_class: 'aiub-header',
+            })]);
+            return;
+        }
+        const box = new St.BoxLayout({x_expand: true, style: 'spacing: 8px;'});
+        box.add_child(new St.Label({
+            text: section.label,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'aiub-row-name',
+        }));
+        box.add_child(new St.Label({
+            text: section.value,
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'aiub-entry-sub',
+        }));
+        this._rowContainer([box]);
+    }
+
+    _addBlockRow(section) {
+        const vbox = new St.BoxLayout({
+            orientation: Clutter.Orientation.VERTICAL,
+            x_expand: true,
+            style_class: 'aiub-row',
+        });
+        vbox.add_child(new St.Label({text: section.label, style_class: 'aiub-row-name'}));
+        if (section.body.length > 0)
+            vbox.add_child(new St.Label({
+                text: section.body.join('\n'),
+                style_class: 'aiub-detail',
+            }));
+        this._rowContainer([vbox]);
+    }
+
+    _addSpacerRow() {
+        this._rowContainer([new St.BoxLayout({style_class: 'aiub-spacer', x_expand: true})]);
+    }
+
+    _addFooter(entries) {
+        // Data age across the merged list: the newest entry fetched_at.
+        let latest = '';
+        for (const entry of entries)
+            if (entry.fetched_at !== '' && entry.fetched_at > latest)
+                latest = entry.fetched_at;
+        if (latest === '')
+            return;
+        this._footerFetchedAt = latest;
+        this._footerLabel = new St.Label({
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            style_class: 'aiub-note',
+        });
+        this._rowContainer([this._footerLabel]);
+        this._updateFooter(this._nowMs);
+    }
+
+    _updateFooter(nowMs) {
+        if (!this._footerLabel)
+            return;
+        const parts = [];
+        if (this._footerFetchedAt !== '')
+            parts.push(formatUpdated(this._footerFetchedAt, nowMs));
+        if (this._busy)
+            parts.push(_('refreshing…'));
+        this._footerLabel.text = parts.join(' · ');
+    }
+
+    // Recompute ONLY the reset strings and the footer — no menu rebuild, no
+    // actor churn every 30 seconds. The bar update recomputes tile markup in
+    // place so the embedded compact countdowns stay live.
+    _onTick() {
+        if (this._destroyed)
+            return;
+        this._nowMs = Date.now();
+        for (const countdown of this._countdowns) {
+            countdown.label.text = formatReset(countdown.resetAt, this._nowMs);
+            countdown.label.visible = countdown.label.text !== '';
+        }
+        this._updateFooter(this._nowMs);
+        this._updateBar();
+    }
+
+    _startTicker() {
+        if (this._tickerId)
+            return;
+        this._tickerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, TICKER_SECS, () => {
+            this._onTick();
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     _restartTimer() {
@@ -203,19 +734,17 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             GLib.source_remove(this._timer);
             this._timer = 0;
         }
-        const secs = Math.max(5, this._settings.get_int('refresh-interval'));
-        this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, secs, () => {
+        this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, this._intervalSeconds(), () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
     }
 
     _refresh() {
-        // Dropping the request while busy meant a vendor change *during* a
-        // fetch never started one for the new vendor: the in-flight result for
-        // the OLD vendor was applied and stayed on the panel until the next
-        // timer tick. Remember that a refresh was asked for and run it as soon
-        // as the current one settles.
+        // Dropping the request while busy meant a change *during* a fetch
+        // never started one for the new state: the in-flight result settled
+        // and nothing followed. Remember that a refresh was asked for and
+        // run it as soon as the current one settles.
         if (this._busy) {
             this._refreshPending = true;
             return;
@@ -223,333 +752,98 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._busy = true;
         const token = ++this._refreshToken;
 
-        const bin = resolveBinary(this._settings);
-        // Captured for THIS attempt: the setting can change while we wait, and
-        // a late result must not be rendered as if it belonged to the vendor
-        // now selected.
-        const vendor = this._settings.get_string('vendor') || 'anthropic';
-        const argv = [bin, '--vendor', vendor, '--format', FORMAT];
+        this._updateFooter(this._nowMs);
+
         const cancellable = new Gio.Cancellable();
         this._refreshCancellable = cancellable;
 
-        let proc;
-        try {
-            proc = new Gio.Subprocess({
-                argv,
-                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
-            });
-            proc.init(cancellable);
-        } catch (e) {
-            this._busy = false;
-            this._refreshCancellable = null;
-            this._refreshPending = false;
-            this._setError(`não consegui executar "${bin}"`, String(e));
-            return;
-        }
-        this._refreshProc = proc;
-
-        let timedOut = false;
-        const timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_TIMEOUT_SECS, () => {
-            timedOut = true;
-            if (this._refreshTimeoutId === timeoutId)
-                this._refreshTimeoutId = 0;
-            try {
-                proc.force_exit();
-            } catch (e) {}
-            cancellable.cancel();
-            if (this._refreshToken === token) {
-                this._busy = false;
-                this._setError('ai-usagebar demorou demais', `timeout após ${REFRESH_TIMEOUT_SECS}s`);
-                // Do not strand a request that arrived while this one hung.
-                if (this._refreshPending) {
-                    this._refreshPending = false;
-                    this._refresh();
+        runJson([resolveBinary(this._settings), 'usage', '--json'],
+            {timeoutSec: REFRESH_TIMEOUT_SECS, cancellable})
+            .then(res => {
+                if (this._destroyed)
+                    return;
+                const current = this._refreshToken === token;
+                if (current) {
+                    this._busy = false;
+                    this._handleResult(res);
                 }
-            }
-            return GLib.SOURCE_REMOVE;
-        });
-        this._refreshTimeoutId = timeoutId;
-
-        const cleanup = () => {
-            if (this._refreshTimeoutId === timeoutId) {
-                GLib.source_remove(timeoutId);
-                this._refreshTimeoutId = 0;
-            }
-            if (this._refreshCancellable === cancellable)
-                this._refreshCancellable = null;
-            if (this._refreshProc === proc)
-                this._refreshProc = null;
-        };
-
-        proc.communicate_utf8_async(null, cancellable, (p, res) => {
-            const current = this._refreshToken === token;
-            if (current)
-                this._busy = false;
-            try {
-                const [, out, err] = p.communicate_utf8_finish(res);
-                cleanup();
-                if (timedOut)
-                    return;
-                // A superseded attempt must not paint the panel: its numbers
-                // belong to whatever vendor was selected when it started.
-                if (!current)
-                    return;
-                // The selection may have changed while this ran even without a
-                // newer attempt (the change is queued as `_refreshPending`).
-                if ((this._settings.get_string('vendor') || 'anthropic') !== vendor)
-                    return;
-                if ((!out || !out.trim()) && !p.get_successful()) {
-                    this._setError('ai-usagebar falhou', err || '');
-                    return;
-                }
-                this._consume(out || '');
-            } catch (e) {
-                cleanup();
-                if (current && !(e instanceof GLib.Error &&
-                      e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) && !timedOut)
-                    this._setError('erro ao ler a saída', String(e));
-            } finally {
-                // Run whatever was requested while we were busy.
                 if (current && this._refreshPending) {
                     this._refreshPending = false;
                     this._refresh();
                 }
-            }
-        });
+            });
     }
 
-    _consume(stdout) {
-        let data;
-        try {
-            data = JSON.parse(stdout);
-        } catch (e) {
-            this._setError('saída inválida', stdout);
-            return;
-        }
-        const raw = plainTextFromPango(data.text);
-        const f = splitFormatOutput(raw);
-        if (f.length <= FIELD.extraLimit) {
-            // Loading… / ⚠ — show the binary's own text.
-            this._data = null;
-            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
-            return;
-        }
-        this._data = {
-            plan: field(f[FIELD.plan]),
-            hasUsageWindows: hasUsageWindows(f[FIELD.vendorShort]),
-            grouped: isGrouped(f[FIELD.sessionModel]),
-            session: {pct: integer(f[FIELD.sessionPct]), reset: field(f[FIELD.sessionReset]),
-                model: field(f[FIELD.sessionModel]),
-                elapsed: markerElapsed(field(f[FIELD.sessionReset]), integer(f[FIELD.sessionElapsed]))},
-            weekly: {pct: integer(f[FIELD.weeklyPct]), reset: field(f[FIELD.weeklyReset]),
-                model: field(f[FIELD.weeklyModel]),
-                elapsed: markerElapsed(field(f[FIELD.weeklyReset]), integer(f[FIELD.weeklyElapsed]))},
-            // Per-model weekly bar: a non-empty scoped model is the presence
-            // signal. A reset may be unavailable, which must not make us show
-            // the unrelated legacy Sonnet window instead.
-            sonnet: (() => {
-                const scopedModel = field(f[FIELD.scopedModel]);
-                if (scopedModel) {
-                    const scopedPct = integer(f[FIELD.scopedPct]);
-                    if (scopedPct != null && scopedPct >= 0 && scopedPct <= 100)
-                        return {pct: scopedPct, reset: field(f[FIELD.scopedReset]) || '—',
-                            model: scopedModel, label: scopedModel,
-                            elapsed: markerElapsed(field(f[FIELD.scopedReset]), integer(f[FIELD.scopedElapsed]))};
-                    // A scoped model with malformed data is unavailable; do
-                    // not fall back to a potentially unrelated Sonnet window.
-                    return {pct: null, reset: '—', model: scopedModel, label: scopedModel, elapsed: null};
-                }
-                return {pct: integer(f[FIELD.sonnetPct]), reset: field(f[FIELD.sonnetReset]),
-                    model: '', label: 'Sonnet only', elapsed: null};
-            })(),
-            // A named extra window (model + reset) renders as a percentage bar;
-            // without a name the slot stays a spent/limit money budget.
-            extra: {pct: integer(f[FIELD.extraPct]), spent: field(f[FIELD.extraSpent]),
-                limit: field(f[FIELD.extraLimit]), model: field(f[FIELD.extraModel]),
-                reset: field(f[FIELD.extraReset]),
-                elapsed: markerElapsed(field(f[FIELD.extraReset]), integer(f[FIELD.extraElapsed]))},
-        };
-        this._render();
-    }
-
-    // Redraw both the panel and the dropdown from cached data + settings.
-    _render() {
-        const d = this._data;
-        if (!d)
-            return;
-        const colors = this._colors();
-        this._renderPanel(d, colors);
-        this._renderDropdown(d, colors);
-    }
-
-    _renderPanel(d, colors) {
-        const w = Math.max(4, Math.min(20, this._settings.get_int('bar-width')));
-        const showPct = this._settings.get_boolean('show-percent');
-        const showBars = this._settings.get_boolean('show-bars');
-
-        const seg = (tag, pct, valueText, elapsed) => {
-            const toks = [`<span foreground="${DIM}">${tag}</span>`];
-            if (showPct)
-                toks.push(`<span foreground="${colorForPct(pct, colors)}">${esc(valueText)}</span>`);
-            if (showBars)
-                toks.push(barMarkup(pct, w, colors, elapsed));
-            if (!showPct && !showBars) // never render an empty segment
-                toks.push(`<span foreground="${colorForPct(pct, colors)}">${esc(valueText)}</span>`);
-            return toks.join(' ');
-        };
-
-        const showSession = this._settings.get_boolean('show-session');
-        const showWeekly = this._settings.get_boolean('show-weekly');
-        const parts = [];
-
-        if (d.grouped) {
-            // Two independent pools. panel-pools picks the pools, show-session /
-            // show-weekly still pick the windows, so segments are pools ×
-            // windows and "just the 5h of both" needs no mode of its own.
-            for (const pool of this._selectedPools(d, showSession, showWeekly)) {
-                if (showSession && pool.session.pct != null) {
-                    parts.push(seg(`${pool.tag} 5h`, pool.session.pct,
-                        `${pool.session.pct}%`, pool.session.elapsed));
-                }
-                if (showWeekly && pool.weekly.pct != null) {
-                    parts.push(seg(`${pool.tag} 7d`, pool.weekly.pct,
-                        `${pool.weekly.pct}%`, pool.weekly.elapsed));
-                }
-            }
-        } else {
-            if (d.hasUsageWindows && showSession && d.session.pct != null)
-                parts.push(seg('5h', d.session.pct, `${d.session.pct}%`, d.session.elapsed));
-            if (d.hasUsageWindows && showWeekly && d.weekly.pct != null)
-                parts.push(seg('7d', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.elapsed));
-            if (this._settings.get_boolean('show-extra') &&
-                d.extra.pct != null && d.extra.spent && d.extra.limit)
-                parts.push(seg('ex', d.extra.pct, d.extra.spent, null)); // $ budget → no meta
-        }
-
-        const gap = `<span foreground="${DIM}">   </span>`;
-        this._label.clutter_text.set_markup(parts.join(gap) || ' ');
-    }
-
-    // The pools the panel should draw, tagged and in display order. Primary is
-    // the generic session/weekly pair; secondary reuses the scoped and extra
-    // slots, which for a grouped vendor hold the second pool's two windows.
-    _selectedPools(d, showSession, showWeekly) {
-        // Either secondary window may be absent. Derive its tag from whichever
-        // model-bearing slot exists instead of assuming the weekly one does.
-        const secondaryModel = d.sonnet.model || d.extra.model;
-        const [primaryTag, secondaryTag] = disambiguateTags(d.session.model, secondaryModel);
-        const primary = {tag: primaryTag, session: d.session, weekly: d.weekly};
-        const secondary = {tag: secondaryTag, session: d.sonnet, weekly: d.extra};
-        const pct = pool => ({
-            session: pool.session.pct,
-            weekly: pool.weekly.pct,
-        });
-        const pools = {primary, secondary};
-        return selectPools(pct(primary), pct(secondary),
-            this._settings.get_string('panel-pools'),
-            this._settings.get_int('panel-auto-threshold'),
-            {session: showSession, weekly: showWeekly})
-            .map(name => pools[name]);
-    }
-
-    _renderDropdown(d, colors) {
-        // Switching vendors can flip the layout; rebuild once when it does.
-        if (!!d.grouped !== !!this._grouped)
-            this._buildMenu(d.grouped);
-
-        this._planLabel.text = d.plan || 'AI Usage';
-
-        const upd = (key, pct, valueText, reset, visible, elapsed) => {
-            const r = this._rows[key];
-            r.item.visible = visible;
-            if (!visible)
+    _handleResult(res) {
+        if (res.stdout.trim() !== '') {
+            // Parse stdout regardless of exit code: a fully-unconfigured
+            // report still exits non-zero and still renders (the QML panel's
+            // finishRefresh semantics).
+            const parsed = parseReport(res.stdout);
+            if (parsed.ok) {
+                this._report = parsed;
+                this._reportError = '';
+                this._lastSuccessfulMs = Date.now();
+                this._buildMenu();
                 return;
-            r.valL.text = valueText;
-            r.barL.clutter_text.set_markup(barMarkup(pct ?? 0, 18, colors, elapsed));
-            if (reset) {
-                r.resetL.text = `↺ resets in ${reset}`;
-                r.resetL.visible = true;
-            } else {
-                r.resetL.visible = false;
             }
-        };
-
-        // Under a group heading the row is named by its pool, not by the window.
-        this._rows.session.nameL.text = d.session.model || 'Session';
-        this._rows.weekly.nameL.text = d.weekly.model || 'Weekly';
-        upd('session', d.session.pct, `${d.session.pct ?? 0}%`, d.session.reset,
-            d.hasUsageWindows && d.session.pct != null, d.session.elapsed);
-        upd('weekly', d.weekly.pct, `${d.weekly.pct ?? 0}%`, d.weekly.reset,
-            d.hasUsageWindows && d.weekly.pct != null, d.weekly.elapsed);
-        this._rows.sonnet.nameL.text = d.sonnet.label || 'Sonnet only';
-        upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null, d.sonnet.elapsed);
-        if (d.extra.model) {
-            // Named quota window (e.g. Antigravity's "Claude & GPT OSS (weekly)").
-            this._rows.extra.nameL.text = d.extra.model;
-            upd('extra', d.extra.pct, `${d.extra.pct}%`, d.extra.reset || '—',
-                d.extra.pct != null, d.extra.elapsed);
+            const detail = res.stderr.trim() !== ''
+                ? errorMessage(res.stderr)
+                : res.error !== '' ? res.error : parsed.error;
+            this._reportError = this._previousReportNotice(detail);
+            this._buildMenu();
+            return;
+        }
+        let message;
+        if (res.error.startsWith('spawn failed') || res.exitCode === 127) {
+            // Gio throws when the binary is missing (no /usr/bin/env shim
+            // here) — surface the same install remedy the QML model gives a
+            // 127 exit instead of a raw spawn error.
+            message = launchErrorMessage(127, res.stderr);
+        } else if (res.error !== '') {
+            message = res.error;
         } else {
-            this._rows.extra.nameL.text = 'Extra Usage';
-            upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null,
-                d.extra.pct != null && !!d.extra.spent && !!d.extra.limit, null); // $ budget → no meta
+            message = errorMessage(res.stderr);
         }
+        this._reportError = this._report
+            ? this._previousReportNotice(message) : message;
+        this._buildMenu();
     }
 
-    _setError(short, detail) {
-        this._data = null;
-        this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ ai</span>`);
-        const msg = detail ? `${short}\n${esc(detail).slice(0, 300)}` : short;
-        this._planLabel.clutter_text.set_markup(`<span foreground="${FG}">${esc(msg)}</span>`);
-        for (const r of Object.values(this._rows))
-            r.item.visible = false;
-    }
-
-    _openTui() {
-        const tui = GLib.find_program_in_path('ai-usagebar-tui') ||
-            `${GLib.get_home_dir()}/.cargo/bin/ai-usagebar-tui`;
-        const candidates = [
-            ['kgx', '--', tui],
-            ['gnome-terminal', '--', tui],
-            ['xterm', '-e', tui],
-        ];
-        for (const argv of candidates) {
-            if (!GLib.find_program_in_path(argv[0]))
-                continue;
-            try {
-                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
-                return;
-            } catch (e) {
-                // try the next terminal
-            }
-        }
-        Main.notify('AI Usage Bar', 'Nenhum terminal encontrado (kgx / gnome-terminal / xterm).');
+    _previousReportNotice(detail) {
+        const base = _('Refresh failed; showing the previous report.');
+        return detail !== '' ? `${base} ${detail}` : base;
     }
 
     destroy() {
+        this._destroyed = true;
+        this._busy = false;
+        this._refreshPending = false;
         if (this._timer) {
             GLib.source_remove(this._timer);
             this._timer = 0;
         }
-        if (this._refreshTimeoutId) {
-            GLib.source_remove(this._refreshTimeoutId);
-            this._refreshTimeoutId = 0;
+        if (this._tickerId) {
+            GLib.source_remove(this._tickerId);
+            this._tickerId = 0;
         }
-        if (this._refreshCancellable)
+        if (this._refreshCancellable) {
             this._refreshCancellable.cancel();
-        if (this._refreshProc) {
-            try {
-                this._refreshProc.force_exit();
-            } catch (e) {}
-            this._refreshProc = null;
+            this._refreshCancellable = null;
         }
-        for (const id of this._viewIds ?? [])
-            this._settings.disconnect(id);
         for (const id of this._sourceIds ?? [])
             this._settings.disconnect(id);
         if (this._intervalId)
             this._settings.disconnect(this._intervalId);
-        this._viewIds = this._sourceIds = null;
+        this._sourceIds = null;
         this._intervalId = 0;
+        this._countdowns = [];
+        this._footerLabel = null;
+        this._tiles = [];
+        this._tileKey = '';
+        this._tileBox = null;
+        this._robotIcon = null;
+        this._robotLabel = null;
         super.destroy();
     }
 });
@@ -570,7 +864,10 @@ export default class AiUsageBarExtension extends Extension {
             existing.destroy();
             delete Main.panel.statusArea[ROLE];
         }
-        this._indicator = new Indicator(this._settings, () => this.openPreferences());
+        const iconFile = this.dir.get_child('icons').get_child('ai-usagebar-symbolic.svg');
+        const logosDir = this.dir.get_child('logos');
+        this._indicator = new Indicator(this._settings, () => this.openPreferences(),
+            iconFile, logosDir);
         const box = this._settings.get_string('panel-box') || 'right';
         const index = Math.max(0, this._settings.get_int('panel-index'));
         Main.panel.addToStatusArea(ROLE, this._indicator, index, box);

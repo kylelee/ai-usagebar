@@ -4,40 +4,20 @@
           path="/org/gnome/shell/extensions/ai-usagebar/">
 
     <key name="refresh-interval" type="i">
-      <default>30</default>
-      <range min="5" max="3600"/>
+      <default>60</default>
+      <range min="30" max="3600"/>
       <summary>Refresh interval in seconds</summary>
     </key>
 
     <key name="vendor" type="s">
-      <default>'anthropic'</default>
-      <summary>Vendor to display (anthropic shows the 5h + weekly windows)</summary>
+      <default>''</default>
+      <summary>Entry filter for the bar: '' tiles every configured account, a vendor slug (e.g. anthropic) shows all accounts of that vendor, an exact entry id (e.g. anthropic@work) shows that single account</summary>
+      <description>Entry ids are the id fields printed by 'ai-usagebar-omarchy usage --json'. Empty is the default all-accounts view; the panel tabs and bar wheel switch entries without changing this key.</description>
     </key>
 
     <key name="binary-path" type="s">
       <default>''</default>
       <summary>Absolute path to the ai-usagebar binary (empty = auto-detect on PATH / ~/.cargo/bin)</summary>
-    </key>
-
-    <key name="bar-width" type="i">
-      <default>8</default>
-      <range min="4" max="20"/>
-      <summary>Width of each bar in cells</summary>
-    </key>
-
-    <key name="show-percent" type="b">
-      <default>true</default>
-      <summary>Show the numeric percentage next to each bar</summary>
-    </key>
-
-    <key name="show-session" type="b">
-      <default>true</default>
-      <summary>Show the 5-hour session bar</summary>
-    </key>
-
-    <key name="show-weekly" type="b">
-      <default>true</default>
-      <summary>Show the weekly bar</summary>
     </key>
 
     <key name="panel-box" type="s">
@@ -56,34 +36,44 @@
       <summary>Position index within the chosen panel area</summary>
     </key>
 
-    <key name="show-extra" type="b">
-      <default>false</default>
-      <summary>Show the extra-usage (cost) bar as a third bar</summary>
+    <key name="show-remaining" type="b">
+      <default>true</default>
+      <summary>Show what is left of each window in the bar tiles instead of the used percentage</summary>
     </key>
 
-    <key name="show-bars" type="b">
+    <key name="bar-tiled" type="b">
       <default>true</default>
-      <summary>Draw the bars; when off, show only the percentages</summary>
+      <summary>Tile every working account side by side; when off, the bar collapses to the selected account alone</summary>
+    </key>
+
+    <key name="show-logos" type="b">
+      <default>true</default>
+      <summary>Lead each bar tile with its provider logo</summary>
+    </key>
+
+    <key name="last-selected-entry" type="s">
+      <default>''</default>
+      <summary>Entry id of the last selected account, restored across shell reloads (written by the extension, not by hand)</summary>
     </key>
 
     <key name="color-low" type="s">
       <default>'#98c379'</default>
-      <summary>Bar color for &lt;50% usage</summary>
+      <summary>Bar color for figures with at least 50% remaining</summary>
     </key>
 
     <key name="color-mid" type="s">
       <default>'#e5c07b'</default>
-      <summary>Bar color for 50-74% usage</summary>
+      <summary>Bar color for figures with &lt;50% remaining</summary>
     </key>
 
     <key name="color-high" type="s">
-      <default>'#d19a66'</default>
-      <summary>Bar color for 75-89% usage</summary>
+      <default>'#d08770'</default>
+      <summary>Bar color for figures with &lt;20% remaining</summary>
     </key>
 
     <key name="color-critical" type="s">
       <default>'#e06c75'</default>
-      <summary>Bar color for 90%+ usage</summary>
+      <summary>Bar color for figures with &lt;5% remaining</summary>
     </key>
 
     <key name="color-empty" type="s">
@@ -91,22 +81,9 @@
       <summary>Color of the empty part of the bar</summary>
     </key>
 
-    <key name="panel-pools" type="s">
-      <choices>
-        <choice value="both"/>
-        <choice value="primary"/>
-        <choice value="secondary"/>
-        <choice value="auto"/>
-      </choices>
-      <default>'both'</default>
-      <summary>Which quota pools the panel shows (vendors with two independent pools only)</summary>
-      <description>Combines with show-session/show-weekly: the panel draws one segment per selected pool per selected window. 'auto' shows the primary pool and falls back to an available secondary once the primary reaches the threshold.</description>
-    </key>
-
-    <key name="panel-auto-threshold" type="i">
-      <default>95</default>
-      <range min="50" max="100"/>
-      <summary>Usage percentage at which the 'auto' pool mode switches to the other pool</summary>
+    <key name="config-rev" type="i">
+      <default>0</default>
+      <summary>Bumped by preferences after every successful settings apply; the extension refreshes when it changes</summary>
     </key>
 
   </schema>

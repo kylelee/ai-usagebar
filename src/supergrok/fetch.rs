@@ -1,5 +1,13 @@
 //! SuperGrok fetch/cache orchestration around Grok Build's billing ACP method.
 
+// Shared-pipeline exception (todo 13 STOP criterion): the Ok path writes the
+// cache only when the account scope fingerprint is stable across the
+// subprocess fetch (a concurrent login must not bind the result to either
+// cache scope), and every failure — transient ones included — persists an
+// error pair when a same-scope, live-period cache is served. Both need hooks
+// `fetch::run_cached_fetch` does not have (conditional Ok-path write;
+// error-pair persistence in the transient arm), so the local shell stays.
+
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;

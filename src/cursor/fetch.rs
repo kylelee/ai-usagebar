@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
 use crate::usage::CursorSnapshot;
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -16,8 +16,6 @@ use super::db;
 use super::types::{self, UsageSummary};
 
 pub const BASE_URL: &str = "https://cursor.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// The dashboard endpoint gates on browser-looking headers; a plain
 /// `reqwest` request with only the cookie is rejected by its CORS check.
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -36,13 +34,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: CursorSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<CursorSnapshot>;
 
 /// Cache-aware fetch. `db_path` is Cursor's `state.vscdb` — the caller resolves
 /// `[cursor] db_path` (config override) vs [`db::default_db_path`], the same
@@ -80,103 +72,41 @@ async fn fetch_snapshot_at(
     cache_ttl: Duration,
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     // Resolve the local identity before accepting a cache hit. Cursor can switch
     // accounts in-place in this database; returning the cache first would show
-    // the previous account's private usage until the TTL elapsed.
+    // the previous account's private usage until the TTL elapsed. The resolved
+    // account key then rides inside the parse closure below, so a cache written
+    // for another account never parses as usable.
     let token = db::resolve_access_token(db_path, agent_auth_path)?;
     let auth = db::session_auth(&token)?;
+    let account = auth.account_key.clone();
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, &auth.account_key, now)
+    // Lock / TTL / fallback shell is the shared pipeline; the closures keep
+    // this vendor's account-scoped payload format and billing-cycle expiry.
+    crate::fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(crate::fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        fetch_live(client, endpoints, &auth),
+        |text| parse_cache_at(text.as_bytes(), &account, now).ok(),
+        |snap| snap_to_json(snap, &account).to_string(),
+    )
+    .await
+    .map(apply_error_pair)
+}
+
+/// Re-apply cursor's diagnostic pair on a served-stale outcome: the shared
+/// failure arms report the cache-level `AUTH_FAILURE_MESSAGE` for 401/403,
+/// while cursor's own policy (and `fetch_live`, which never lets a raw auth
+/// body through) uses its fixed string for those codes.
+fn apply_error_pair(mut outcome: FetchOutcome) -> FetchOutcome {
+    if let Some((code, msg)) = &outcome.last_error
+        && matches!(code, 401 | 403)
+        && msg == crate::error::AUTH_FAILURE_MESSAGE
     {
-        return Ok(outcome);
+        outcome.last_error = Some((*code, "Cursor authentication failed".into()));
     }
-
-    match fetch_live(client, endpoints, &auth).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(&snap_to_json(&snap, &auth.account_key))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, &auth.account_key, now, e),
-        Err(e) => {
-            cache.mark_stale();
-            if let Some((code, msg)) = error_to_pair(&e) {
-                cache.write_last_error(code, &msg);
-            }
-            fallback_with_error(cache, &auth.account_key, now, e)
-        }
-    }
-}
-
-fn fallback_silent(
-    cache: &Cache,
-    account: &str,
-    now: DateTime<Utc>,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(&bytes, cache, true, account, now) {
-        Ok(outcome) => Ok(outcome),
-        Err(_) => Err(original),
-    }
-}
-
-fn fallback_with_error(
-    cache: &Cache,
-    account: &str,
-    now: DateTime<Utc>,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(&bytes, cache, true, account, now) {
-        Ok(mut outcome) => {
-            outcome.last_error = error_to_pair(&original);
-            Ok(outcome)
-        }
-        Err(_) => Err(original),
-    }
-}
-
-/// Never surface upstream bodies for auth failures: the request carried a
-/// session cookie derived from a signed-in token, and 401/403 bodies from a
-/// scraped web endpoint are not guaranteed not to echo it back.
-fn error_to_pair(e: &AppError) -> Option<(u16, String)> {
-    match e {
-        AppError::Http { status, .. } if matches!(status, 401 | 403) => {
-            Some((*status, "Cursor authentication failed".into()))
-        }
-        AppError::Http { status, body } => Some((*status, body.clone())),
-        e => Some((0, e.to_string())),
-    }
-}
-
-fn reuse_cache(
-    bytes: &[u8],
-    cache: &Cache,
-    stale: bool,
-    account: &str,
-    now: DateTime<Utc>,
-) -> Result<FetchOutcome> {
-    let snap = parse_cache_at(bytes, account, now)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    outcome
 }
 
 fn parse_cache_at(bytes: &[u8], account: &str, now: DateTime<Utc>) -> Result<CursorSnapshot> {
@@ -253,7 +183,7 @@ async fn fetch_live(
     // usage-summary keys off the session cookie alone (no `?user=` param); the
     // browser-ish headers get past its CORS gate.
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(crate::fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(&endpoints.summary)
             .header(

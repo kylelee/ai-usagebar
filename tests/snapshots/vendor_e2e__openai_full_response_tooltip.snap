@@ -1,0 +1,29 @@
+---
+source: tests/vendor_e2e.rs
+expression: "normalize_updated_time(&out.tooltip, outcome.cache_age)"
+---
+<span foreground='#61afef'>╭───────────────────────────────╮</span>
+<span foreground='#61afef'>│</span>         <span font_weight='bold' foreground='#61afef'>ChatGPT Plus</span>          <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰔟  Codex 5h</span>                 <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>███████</span><span foreground='#3e4451'>░░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>37%</span>   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 2h 00m</span>         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰃰  Codex weekly</span>             <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#d19a66'>████████████████</span><span foreground='#3e4451'>░░░░</span>  <span font_weight='bold' foreground='#d19a66'>80%</span>   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 5d 3h</span>          <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󱦰  Code review (weekly)</span>     <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>████</span><span foreground='#3e4451'>░░░░░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>22%</span>   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 6d 22h</span>         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰄑  Credits</span>                  <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>     balance: $2.50</span>           <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>     ~ 100-200 local messages</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>     ~ 30-50 cloud messages</span>   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  󰅐  Updated HH:MM</span>            <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>╰───────────────────────────────╯</span>

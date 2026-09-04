@@ -42,8 +42,13 @@ pub fn render_anthropic(input: &RenderInput) -> WaybarOutput {
     let class = Class::from(anthropic_severity(snap));
     let bar_text = render_bar_text(input, class);
     let tooltip = if let Some(fmt) = input.tooltip_format {
-        // Custom tooltip uses the same placeholder set as the bar.
-        let values = build_placeholders(input);
+        // Custom tooltip uses the same placeholder set as the bar; values
+        // are escaped at this sink so an untrusted field (plan name, scoped
+        // label) cannot inject Pango tags through a custom format.
+        let values: HashMap<&'static str, String> = build_placeholders(input)
+            .into_iter()
+            .map(|(key, value)| (key, escape(&value)))
+            .collect();
         substitute(fmt, &values)
     } else {
         render_default_tooltip(input)
@@ -333,58 +338,17 @@ fn insert_pace(
     }
 }
 
-/// The bordered Pango tooltip (claudebar:707-860).
+/// The bordered Pango tooltip (claudebar:707-860). The window rows go
+/// through the shared [`tooltip::push_window_with_row`] every other vendor
+/// uses; only the extra-usage block and the error/updated footers are
+/// Anthropic-specific.
 fn render_default_tooltip(input: &RenderInput) -> String {
     let snap = &input.outcome.snapshot;
     let theme = input.theme;
     let blue = &theme.blue;
     let dim = &theme.dim;
-    let fg = &theme.fg;
-
-    let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
-    let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
-
-    let session_pacing = pacing::calc(
-        snap.session.utilization_pct,
-        snap.session.resets_at,
-        input.now,
-        snap.session.window_duration,
-        input.pace_tolerance,
-    );
-    let weekly_pacing = pacing::calc(
-        snap.weekly.utilization_pct,
-        snap.weekly.resets_at,
-        input.now,
-        snap.weekly.window_duration,
-        input.pace_tolerance,
-    );
-
-    let session_bar = if input.tooltip_pace_pts {
-        pango::progress_bar(
-            snap.session.utilization_pct,
-            session_color,
-            theme,
-            Some(session_pacing.elapsed_pct),
-        )
-    } else {
-        pango::progress_bar(snap.session.utilization_pct, session_color, theme, None)
-    };
-    let weekly_bar = if input.tooltip_pace_pts {
-        pango::progress_bar(
-            snap.weekly.utilization_pct,
-            weekly_color,
-            theme,
-            Some(weekly_pacing.elapsed_pct),
-        )
-    } else {
-        pango::progress_bar(snap.weekly.utilization_pct, weekly_color, theme, None)
-    };
-
-    let session_pace_glyph = pick_pace_glyph(input.tooltip_pace_pts, &session_pacing);
-    let weekly_pace_glyph = pick_pace_glyph(input.tooltip_pace_pts, &weekly_pacing);
 
     let mut lines: Vec<Line> = Vec::new();
-    let _ = pango::severity_color; // silence unused-import warning if any
     lines.push(Line::Center(format!(
         "<span font_weight='bold' foreground='{blue}'>Claude {plan}</span>",
         plan = escape(&snap.plan)
@@ -392,106 +356,80 @@ fn render_default_tooltip(input: &RenderInput) -> String {
     lines.push(Line::Sep);
     lines.push(Line::Body("".into()));
 
-    lines.push(Line::Body(format!(
-        " <span foreground='{fg}'>  󰔟  Session</span>"
-    )));
-    lines.push(Line::Body(format!(
-        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}% {glyph}</span>",
-        bar = session_bar,
-        color = session_color,
-        pct = snap.session.utilization_pct,
-        glyph = session_pace_glyph
-    )));
-    lines.push(Line::Body(format!(
-        " <span foreground='{dim}'>  ⏱  Resets in {cd}</span>",
-        cd = escape(&countdown::format(snap.session.resets_at, input.now))
-    )));
+    // Session/Weekly carry the pace glyph (ratio mode by default, point
+    // mode behind `--tooltip-pace-pts`).
+    tooltip::push_window_with_row(
+        &mut lines,
+        "  󰔟  Session",
+        &snap.session,
+        theme,
+        input.now,
+        tooltip::WindowRow::paced(
+            &snap.session,
+            input.now,
+            input.pace_tolerance,
+            input.tooltip_pace_pts,
+        ),
+    );
     lines.push(Line::Body("".into()));
+    tooltip::push_window_with_row(
+        &mut lines,
+        "  󰃰  Weekly",
+        &snap.weekly,
+        theme,
+        input.now,
+        tooltip::WindowRow::paced(
+            &snap.weekly,
+            input.now,
+            input.pace_tolerance,
+            input.tooltip_pace_pts,
+        ),
+    );
 
-    lines.push(Line::Body(format!(
-        " <span foreground='{fg}'>  󰃰  Weekly</span>"
-    )));
-    lines.push(Line::Body(format!(
-        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}% {glyph}</span>",
-        bar = weekly_bar,
-        color = weekly_color,
-        pct = snap.weekly.utilization_pct,
-        glyph = weekly_pace_glyph
-    )));
-    lines.push(Line::Body(format!(
-        " <span foreground='{dim}'>  ⏱  Resets in {cd}</span>",
-        cd = escape(&countdown::format(snap.weekly.resets_at, input.now))
-    )));
-
+    // Sonnet and the model-scoped windows show no pace glyph, only the
+    // elapsed marker behind `--tooltip-pace-pts`.
     if let Some(sw) = snap.sonnet.as_ref() {
-        let sonnet_color = pango::severity_color(severity_for(sw.utilization_pct), theme);
-        let sonnet_pacing = pacing::calc(
+        lines.push(Line::Body("".into()));
+        let pacing = pacing::calc(
             sw.utilization_pct,
             sw.resets_at,
             input.now,
             sw.window_duration,
             input.pace_tolerance,
         );
-        let sonnet_bar = if input.tooltip_pace_pts {
-            pango::progress_bar(
-                sw.utilization_pct,
-                sonnet_color,
-                theme,
-                Some(sonnet_pacing.elapsed_pct),
-            )
-        } else {
-            pango::progress_bar(sw.utilization_pct, sonnet_color, theme, None)
-        };
-        lines.push(Line::Body("".into()));
-        lines.push(Line::Body(format!(
-            " <span foreground='{fg}'>  󱤔  Sonnet only</span>"
-        )));
-        lines.push(Line::Body(format!(
-            "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%</span>",
-            bar = sonnet_bar,
-            color = sonnet_color,
-            pct = sw.utilization_pct
-        )));
-        lines.push(Line::Body(format!(
-            " <span foreground='{dim}'>  ⏱  Resets in {cd}</span>",
-            cd = escape(&countdown::format(sw.resets_at, input.now))
-        )));
+        tooltip::push_window_with_row(
+            &mut lines,
+            "  󱤔  Sonnet only",
+            sw,
+            theme,
+            input.now,
+            tooltip::WindowRow {
+                marker_pct: input.tooltip_pace_pts.then_some(pacing.elapsed_pct),
+                ..tooltip::WindowRow::default()
+            },
+        );
     }
 
     for sw in &snap.scoped {
-        let scoped_color = pango::severity_color(severity_for(sw.window.utilization_pct), theme);
-        let scoped_pacing = pacing::calc(
+        lines.push(Line::Body("".into()));
+        let pacing = pacing::calc(
             sw.window.utilization_pct,
             sw.window.resets_at,
             input.now,
             sw.window.window_duration,
             input.pace_tolerance,
         );
-        let scoped_bar = if input.tooltip_pace_pts {
-            pango::progress_bar(
-                sw.window.utilization_pct,
-                scoped_color,
-                theme,
-                Some(scoped_pacing.elapsed_pct),
-            )
-        } else {
-            pango::progress_bar(sw.window.utilization_pct, scoped_color, theme, None)
-        };
-        lines.push(Line::Body("".into()));
-        lines.push(Line::Body(format!(
-            " <span foreground='{fg}'>  󰆧  {label} weekly</span>",
-            label = escape(&sw.label)
-        )));
-        lines.push(Line::Body(format!(
-            "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%</span>",
-            bar = scoped_bar,
-            color = scoped_color,
-            pct = sw.window.utilization_pct
-        )));
-        lines.push(Line::Body(format!(
-            " <span foreground='{dim}'>  ⏱  Resets in {cd}</span>",
-            cd = escape(&countdown::format(sw.window.resets_at, input.now))
-        )));
+        tooltip::push_window_with_row(
+            &mut lines,
+            &format!("  󰆧  {} weekly", escape(&sw.label)),
+            &sw.window,
+            theme,
+            input.now,
+            tooltip::WindowRow {
+                marker_pct: input.tooltip_pace_pts.then_some(pacing.elapsed_pct),
+                ..tooltip::WindowRow::default()
+            },
+        );
     }
 
     if let Some(extra) = snap.extra.as_ref() {
@@ -500,7 +438,8 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         lines.push(Line::Body("".into()));
         lines.push(Line::Sep);
         lines.push(Line::Body(format!(
-            " <span foreground='{fg}'>  󰄑  Extra usage</span>"
+            " <span foreground='{fg}'>  󰄑  Extra usage</span>",
+            fg = theme.fg
         )));
         lines.push(Line::Body(format!(
             "   {bar}  <span font_weight='bold' foreground='{color}'>{spent}</span>",
@@ -552,23 +491,17 @@ fn render_default_tooltip(input: &RenderInput) -> String {
     tooltip::render_bordered(&lines, theme)
 }
 
-fn pick_pace_glyph(point_mode: bool, p: &pacing::Pacing) -> &'static str {
-    if point_mode {
-        p.point_pace.glyph()
-    } else {
-        p.ratio_pace.glyph()
-    }
-}
-
-/// Greedy word-wrap to a target column. Used for the API-error message
+/// Greedy word-wrap to a target column, measured in characters (not bytes —
+/// CJK text is 3 bytes per char and byte math wrapped far too early). Shared
+/// with the aggregate tooltip's error rows. Used for the API-error message
 /// in the tooltip (claudebar:779-790).
-fn wrap_words(s: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_words(s: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
     for word in s.split_whitespace() {
         if buf.is_empty() {
             buf = word.into();
-        } else if buf.len() + 1 + word.len() <= width {
+        } else if buf.chars().count() + 1 + word.chars().count() <= width {
             buf.push(' ');
             buf.push_str(word);
         } else {
@@ -856,5 +789,71 @@ mod tests {
         let lines = wrap_words("aaa bbb ccc ddd eee fff", 8);
         // "aaa bbb" (7) fits; "ccc ddd" (7) fits next; "eee fff" (7) next.
         assert_eq!(lines, vec!["aaa bbb", "ccc ddd", "eee fff"]);
+    }
+
+    #[test]
+    fn custom_tooltip_format_escapes_placeholder_values() {
+        // The custom --tooltip-format branch substitutes raw values; a plan
+        // name carrying markup would inject Pango tags into the tooltip.
+        // The default tooltip escapes at the sink — this branch is the gap.
+        let mut oc = sample_outcome();
+        oc.snapshot.plan = "<script>alert('x')</script>".into();
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.tooltip_format = Some("{plan}");
+        let out = render_anthropic(&inp);
+        assert!(
+            out.tooltip.contains("&lt;script&gt;"),
+            "tooltip must escape markup: {}",
+            out.tooltip
+        );
+        assert!(
+            !out.tooltip.contains("<script>"),
+            "raw markup leaked into the tooltip: {}",
+            out.tooltip
+        );
+
+        // The bar-text path stays raw-substituted (unchanged contract).
+        let mut inp_bar = input(&oc, &theme);
+        inp_bar.format = "{plan}";
+        let out_bar = render_anthropic(&inp_bar);
+        assert!(
+            out_bar.text.contains("<script>"),
+            "bar text must stay raw: {}",
+            out_bar.text
+        );
+    }
+
+    #[test]
+    fn wrap_words_counts_chars_not_bytes_for_cjk() {
+        // Two 12-char CJK words joined: 25 columns — fits width 35 — but
+        // 73 bytes, which byte-based math wrongly refuses to join.
+        let a = "一二三四五六七八九十甲乙";
+        let b = "丙丁戊己庚辛壬癸子丑寅卯";
+        assert_eq!(
+            wrap_words(&format!("{a} {b}"), 35),
+            vec![format!("{a} {b}")]
+        );
+    }
+
+    #[test]
+    fn wrap_words_wraps_cjk_at_the_char_boundary() {
+        // Three 12-char words: two joined reach 25 columns (fits); joining
+        // the third would reach 38 (> 35) → wraps. Byte math would have
+        // split after the very first word.
+        let w1 = "一二三四五六七八九十甲乙";
+        let w2 = "丙丁戊己庚辛壬癸子丑寅卯";
+        let w3 = "辰巳午未申酉戌亥辰巳午未";
+        let lines = wrap_words(&format!("{w1} {w2} {w3}"), 35);
+        assert_eq!(lines, vec![format!("{w1} {w2}"), w3.to_string()]);
+    }
+
+    #[test]
+    fn wrap_words_edge_inputs_do_not_panic() {
+        assert!(wrap_words("", 35).is_empty());
+        assert_eq!(wrap_words("好", 35), vec!["好"]);
+        // A single unbroken word never splits, however long.
+        let run = "好".repeat(40);
+        assert_eq!(wrap_words(&run, 35), vec![run]);
     }
 }

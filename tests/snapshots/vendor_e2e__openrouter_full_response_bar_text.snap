@@ -1,0 +1,5 @@
+---
+source: tests/vendor_e2e.rs
+expression: "&out.text"
+---
+<span foreground='#98c379'>$74.50 · $1.00</span>

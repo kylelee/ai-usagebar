@@ -9,7 +9,8 @@ PLASMOID_ID ?= io.github.kylelee.ai-usagebar-omarchy
 PLASMOID_DIR = $(abspath $(DESTDIR)$(PREFIX))/share/plasma/plasmoids/$(PLASMOID_ID)
 
 .PHONY: build install uninstall install-plasmoid uninstall-plasmoid \
-	test desktop-test plugin-test qml-lint qml-test mjs-probe smoke clippy fmt clean
+	test desktop-test plugin-test qml-lint qml-test mjs-probe smoke clippy fmt \
+	machete validate release-check release-bump clean
 
 build:
 	cargo build --release
@@ -44,12 +45,12 @@ uninstall-plasmoid:
 	rm -rf -- "$(PLASMOID_DIR)"
 
 test:
-	cargo test
+	cargo test --locked
 	$(MAKE) desktop-test
 	$(MAKE) plugin-test
 
 desktop-test:
-	node gnome-extension/marker-logic.test.mjs
+	node gnome-extension/report-model.test.mjs
 	node kde-plasmoid/plasmoid-logic.test.mjs
 
 plugin-test:
@@ -125,6 +126,35 @@ smoke:
 
 clippy:
 	cargo clippy --all-targets -- -D warnings
+
+# Part of the pre-tag gate (CLAUDE.md step 6). CI enforces it via the
+# cargo-machete action; locally the subcommand must be installed by hand
+# (`cargo install cargo-machete`) or this target reports the missing one.
+machete:
+	cargo machete
+
+# Pre-tag gate from CLAUDE.md step 6: checks manifest.json + entry points.
+# Local/optional by design — it needs the Omarchy CLI, which CI does not have,
+# so it is deliberately NOT a CI job (unlike release-check).
+validate:
+	@command -v omarchy >/dev/null 2>&1 || { echo "omarchy not found — install the Omarchy CLI to run this gate" >&2; exit 1; }
+	omarchy plugin validate .
+
+# Same gate release.yml runs at tag time (scripts/check-release-versions.sh is
+# the single source); here so it can be run before tagging without pushing.
+release-check:
+	bash scripts/check-release-versions.sh
+
+# CLAUDE.md release checklist steps 1/3/4/5 in one command: the six version
+# locations + the CHANGELOG [Unreleased] compare link. Step 2 (the release's
+# own CHANGELOG section) stays manual — the release-check the script runs at
+# the end stays red until it exists, which is the reminder. Aborts on a dirty
+# tree; never commits, tags, or pushes. The .SRCINFO edit is a portable sed;
+# on Arch, CLAUDE.md step 5's `makepkg --printsrcinfo` scratch-dir procedure
+# is the AUTHORITATIVE regeneration path.
+release-bump:
+	@test -n "$(V)" || { echo "usage: make release-bump V=X.Y.Z" >&2; exit 1; }
+	bash scripts/release-bump.sh "$(V)"
 
 fmt:
 	cargo fmt

@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::countdown;
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, updated_at_hm};
 use crate::pacing::PaceSeverity;
-use crate::pango::{color_span, escape, severity_color, severity_for};
+use crate::pango::{escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::CursorSnapshot;
-use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
-use crate::waybar::{Class, WaybarOutput};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome, render_shell};
+use crate::waybar::WaybarOutput;
 
 use super::fetch::FetchOutcome;
 
@@ -74,40 +74,28 @@ pub fn render(
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> WaybarOutput {
-    let class = Class::from(severity(snap));
-    let format = opts
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
     let values = build_placeholders(snap, now);
-
-    let mut text = if snap.unlimited && opts.format.is_none() {
-        "unlimited".to_string()
+    // An unlimited plan replaces the DEFAULT format outright (no placeholders
+    // — the literal substitutes to itself); an explicit --format still wins.
+    let unlimited_opts;
+    let shell_opts = if snap.unlimited && opts.format.is_none() {
+        let mut o = opts.clone();
+        o.format = Some("unlimited".into());
+        unlimited_opts = o;
+        &unlimited_opts
     } else {
-        substitute(&format, &values)
-    };
-    if outcome.stale {
-        text.push_str(" ⏸");
-    }
-
-    let wrapper_color = severity_color(severity(snap), theme).to_string();
-    let icon_prefix = match opts.icon.as_deref() {
-        Some(ic) if !ic.is_empty() => format!("{ic} "),
-        _ => String::new(),
-    };
-    let bar_text = color_span(&wrapper_color, &format!("{icon_prefix}{text}"));
-
-    let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
-        substitute(fmt, &values)
-    } else {
-        render_tooltip(outcome, snap, theme, now)
+        opts
     };
 
-    WaybarOutput {
-        text: bar_text,
-        tooltip,
-        class,
-    }
+    render_shell(
+        DEFAULT_FORMAT,
+        &values,
+        shell_opts,
+        outcome.stale,
+        Some(severity(snap)),
+        theme,
+        render_tooltip(outcome, snap, theme, now),
+    )
 }
 
 fn pool_line(lines: &mut Vec<TooltipLine>, theme: &Theme, label: &str, pct: i32) {

@@ -5,16 +5,15 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch::{HTTP_TIMEOUT_DEFAULT_SECS, LOCK_TIMEOUT_SECS, run_cached_fetch};
 use crate::usage::{KiloSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
 use super::types::{BalanceData, to_snapshot};
 
 pub const BASE_URL: &str = "https://api.kilo.ai";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -29,17 +28,17 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: KiloSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<KiloSnapshot>;
 
 /// Cache-aware fetch. `organization_id`, when set, scopes the balance to a team
 /// (the `x-kilocode-organizationid` header); omitting it returns the personal
 /// balance.
+///
+/// On failure we show the last good figure with the error alongside it. With
+/// nothing usable cached there is nothing to show, so the **original** error is
+/// returned rather than a generic "no usable cache" that hides what went wrong
+/// — exactly the fallback policy the shared `run_cached_fetch` implements, so
+/// this wrapper returns its result unmapped.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     api_key: &str,
@@ -48,45 +47,20 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
     organization_id: Option<&str>,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     let target = target_key(organization_id);
-
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, &target)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, api_key, organization_id).await {
-        Ok(balance) => {
-            let snap = to_snapshot(balance)?;
-            let cache_repr = serde_json::json!({
-                "target": target,
-                "snapshot": { "label": snap.label, "balance": snap.balance },
-            });
-            let bytes = serde_json::to_vec(&cache_repr)?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), &target, e)
-        }
-    }
+    let live = async {
+        let balance = fetch_live(client, endpoints, api_key, organization_id).await?;
+        to_snapshot(balance)
+    };
+    run_cached_fetch(
+        cache,
+        Duration::from_secs(LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        live,
+        |text| parse_cache(text, &target).ok(),
+        |snap| snapshot_json(snap, &target),
+    )
+    .await
 }
 
 /// Identity of the account the cached figure belongs to. A balance fetched for
@@ -99,45 +73,18 @@ fn target_key(organization_id: Option<&str>) -> String {
     }
 }
 
-fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // A cache we cannot attribute to this target is no better than no cache.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
-    let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
+/// The shared pipeline stores `to_json` output verbatim; `Value::to_string`
+/// is the same compact encoding `serde_json::to_vec` produced before.
+fn snapshot_json(snap: &KiloSnapshot, target: &str) -> String {
+    serde_json::json!({
+        "target": target,
+        "snapshot": { "label": snap.label, "balance": snap.balance },
     })
+    .to_string()
 }
 
-fn parse_cache(bytes: &[u8], target: &str) -> Result<KiloSnapshot> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)?;
+fn parse_cache(text: &str, target: &str) -> Result<KiloSnapshot> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
     // Payloads written before the target was recorded are not attributable to
     // an account, so they are discarded rather than shown against this one.
     let cached_target = v.get("target").and_then(serde_json::Value::as_str);
@@ -175,7 +122,7 @@ async fn fetch_live(
         req = req.header("x-kilocode-organizationid", org);
     }
 
-    let resp = tokio::time::timeout(HTTP_TIMEOUT, req.send())
+    let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_DEFAULT_SECS), req.send())
         .await
         .map_err(|_| AppError::Transport(format!("kilo timeout: {}", endpoints.balance)))??;
 

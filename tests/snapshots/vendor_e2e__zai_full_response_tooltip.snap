@@ -1,0 +1,24 @@
+---
+source: tests/vendor_e2e.rs
+expression: "normalize_updated_time(&out.tooltip, outcome.cache_age)"
+---
+<span foreground='#61afef'>╭───────────────────────────────╮</span>
+<span foreground='#61afef'>│</span>        <span font_weight='bold' foreground='#61afef'>GLM Coding Pro</span>         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰔟  Session (5h)</span>             <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>████████</span><span foreground='#3e4451'>░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>42% ↓</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 2h 05m</span>         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰃰  Weekly</span>                   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>███</span><span foreground='#3e4451'>░░░░░░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>15% ↓</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 3d 4h</span>          <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰓹  MCP tools (monthly)</span>      <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#98c379'>██████</span><span foreground='#3e4451'>░░░░░░░░░░░░░░</span>  <span font_weight='bold' foreground='#98c379'>30% ↓</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 12d 0h</span>         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  󰅐  Updated HH:MM</span>            <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>╰───────────────────────────────╯</span>

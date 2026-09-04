@@ -5,8 +5,8 @@
 #   ./scripts/build.sh            cargo build --release
 #   ./scripts/build.sh <args>     extra flags pass through to cargo
 #
-# Same build as `make build` / `scripts/install.sh` step 0; kept separate so
-# a plain "compile it" needs no deploy side effects.
+# Same build as `make build` / `scripts/install-omarchy.sh` step 0; kept
+# separate so a plain "compile it" needs no deploy side effects.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)

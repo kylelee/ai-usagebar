@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
 use crate::usage::{AnthropicApiSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -19,8 +19,6 @@ use super::types::{CostReport, page_dollars};
 
 pub const BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Safety cap on pagination — a single month is at most 31 daily buckets, so a
 /// handful of pages is plenty; this just bounds a runaway `next_page` loop.
 const MAX_PAGES: usize = 12;
@@ -38,13 +36,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: AnthropicApiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<AnthropicApiSnapshot>;
 
 /// First instant of `now`'s calendar month, as an RFC-3339 UTC string.
 fn month_start_rfc3339(now: DateTime<Utc>) -> String {
@@ -110,111 +102,40 @@ pub async fn fetch_snapshot_at(
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
     let limit = validate_limit(limit)?;
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     // The query always starts at the current month, so a payload written last
     // month is a *different* figure — not a stale version of this one.
     let month = month_start_rfc3339(now);
     let target = target_key(admin_key);
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, limit, &month, &target)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, admin_key, now).await {
-        Ok(spent) => {
-            let snap = AnthropicApiSnapshot { spent, limit };
-            let bytes = serde_json::to_vec(&serde_json::json!({
+    // Lock / TTL / fallback shell is the shared pipeline; the closures keep
+    // this vendor's payload envelope (month + key fingerprint + snapshot) and
+    // its current-config limit rule below.
+    crate::fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(crate::fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        async {
+            fetch_live(client, endpoints, admin_key, now)
+                .await
+                .map(|spent| AnthropicApiSnapshot { spent, limit })
+        },
+        // The cached spend is authoritative; the limit always comes from the
+        // current config so editing it takes effect without a refetch.
+        |text| {
+            parse_cached_spent(text.as_bytes(), &month, &target)
+                .ok()
+                .map(|spent| AnthropicApiSnapshot { spent, limit })
+        },
+        |snap| {
+            serde_json::json!({
                 "month": month,
                 "target": target,
                 "snapshot": { "spent": snap.spent, "limit": snap.limit },
-            }))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
             })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, limit, &month, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(
-                cache,
-                Some(diag),
-                limit,
-                &month,
-                &target,
-                AppError::Http { status, body },
-            )
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), limit, &month, &target, e)
-        }
-    }
-}
-
-fn fallback_silent(
-    cache: &Cache,
-    limit: Option<f64>,
-    month: &str,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, limit, month, target)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned — a first-run 401/403 or schema error must reach the user with its
-/// Admin-key guidance intact, not as a generic "no usable cache".
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    limit: Option<f64>,
-    month: &str,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // Last month's spend is not this month's, so during an outage it is better
-    // to report the error than to display the wrong month as current.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, limit, month, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(
-    bytes: &[u8],
-    cache: &Cache,
-    stale: bool,
-    limit: Option<f64>,
-    month: &str,
-    target: &str,
-) -> Result<FetchOutcome> {
-    // The cached spend is authoritative; the limit always comes from the
-    // current config so editing it takes effect without a refetch.
-    let spent = parse_cached_spent(bytes, month, target)?;
-    Ok(FetchOutcome {
-        snapshot: AnthropicApiSnapshot { spent, limit },
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+            .to_string()
+        },
+    )
+    .await
 }
 
 fn parse_cached_spent(bytes: &[u8], month: &str, target: &str) -> Result<f64> {
@@ -267,11 +188,14 @@ async fn fetch_live(
             req = req.query(&[("page", p.as_str())]);
         }
 
-        let resp = tokio::time::timeout(HTTP_TIMEOUT, req.send())
-            .await
-            .map_err(|_| {
-                AppError::Transport(format!("anthropic-api timeout: {}", endpoints.cost_report))
-            })??;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(crate::fetch::HTTP_TIMEOUT_ADMIN_API_SECS),
+            req.send(),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Transport(format!("anthropic-api timeout: {}", endpoints.cost_report))
+        })??;
 
         let status = resp.status();
         let bytes = read_body_capped(resp, MAX_BODY_BYTES).await?;

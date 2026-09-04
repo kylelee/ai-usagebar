@@ -4,14 +4,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, updated_at_hm, usd};
+use crate::format::{placeholders, updated_at_hm, usd};
 use crate::pacing::PaceSeverity;
-use crate::pango::{self, color_span, escape, severity_color, severity_for};
+use crate::pango::{self, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::OpenRouterSnapshot;
-use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
-use crate::waybar::{Class, WaybarOutput};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome, render_shell};
+use crate::waybar::WaybarOutput;
 
 use super::fetch::FetchOutcome;
 
@@ -65,14 +65,7 @@ pub fn render(
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> WaybarOutput {
-    let class = Class::from(severity(snap));
-    let format = opts
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.replace('$', ""));
     let mut values = build_placeholders(snap);
-    // The default format above uses ${…} (legible in a shell context), so
-    // strip the $ to match our placeholder syntax.
     values.insert("or_balance_bar", or_balance_bar(snap, theme));
     // Both sinks fed by this map (bar text and --tooltip-format) end up as
     // Pango markup, and the label is API-controlled — escape it here, its only
@@ -84,29 +77,15 @@ pub fn render(
         }
     }
 
-    let format_clean = format.replace("${", "{");
-    let mut text = substitute(&format_clean, &values);
-    if outcome.stale {
-        text.push_str(" ⏸");
-    }
-    let wrapper_color = severity_color(severity(snap), theme).to_string();
-    let icon_prefix = match opts.icon.as_deref() {
-        Some(ic) if !ic.is_empty() => format!("{ic} "),
-        _ => String::new(),
-    };
-    let bar_text = color_span(&wrapper_color, &format!("{icon_prefix}{text}"));
-
-    let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
-        substitute(&fmt.replace("${", "{"), &values)
-    } else {
-        render_tooltip(outcome, snap, theme, now)
-    };
-
-    WaybarOutput {
-        text: bar_text,
-        tooltip,
-        class,
-    }
+    render_shell(
+        DEFAULT_FORMAT,
+        &values,
+        opts,
+        outcome.stale,
+        Some(severity(snap)),
+        theme,
+        render_tooltip(outcome, snap, theme, now),
+    )
 }
 
 fn or_balance_bar(snap: &OpenRouterSnapshot, theme: &Theme) -> String {

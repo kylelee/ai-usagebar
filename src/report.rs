@@ -7,24 +7,26 @@
 //! enabled vendor, plus one entry per named Claude account — and prints what
 //! each one has left.
 //!
-//! Deliberately thin: [`crate::tui::app::tabs_from_config`] already decides
-//! what is configured, [`crate::tui::app::refresh_one`] already fetches and
-//! parses it, and [`crate::tui::panels::sections_for`] already projects any
-//! vendor's snapshot into labelled sections carrying every reported value.
-//! So this file only enumerates, projects, and formats — no vendor
-//! ever needs to know it exists.
+//! Deliberately thin: [`crate::tabs::tabs_from_config`] already decides
+//! what is configured, [`crate::tabs::refresh_one`] already fetches and
+//! parses it, and [`crate::tabs::sections_with_metadata_for`] already
+//! projects any vendor's snapshot into labelled sections carrying every
+//! reported value. So this file only enumerates, projects, and formats —
+//! no vendor ever needs to know it exists.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 
 use crate::config::Config;
-use crate::tui::app::{TabId, TabState, refresh_one, tabs_with_desktop};
-use crate::tui::panels::{Section, sections_with_metadata_for};
+use crate::pacing::{self, PaceSeverity};
+use crate::tabs::{
+    Section, TabId, TabState, refresh_one, sections_with_metadata_for, tabs_with_desktop,
+};
 
 /// Matches the widget's `--pace-tolerance` default; only affects the pacing
 /// note appended to a metric's detail line.
-const PACE_TOLERANCE: u32 = 5;
+const PACE_TOLERANCE: u32 = pacing::DEFAULT_TOLERANCE;
 
 /// One configured vendor or account.
 #[derive(Debug, Clone)]
@@ -51,6 +53,10 @@ struct Entry {
     /// exhausted tiles (the tab and the popup keep them); recovery is
     /// automatic because the flag is recomputed from every fresh report.
     exhausted: bool,
+    /// The precomputed tile headline (fullest metric / balance figure), so
+    /// no frontend has to re-derive which figure leads. `None` for error
+    /// entries and entries with nothing reportable.
+    headline: Option<Headline>,
     stale: bool,
     fetched_at: Option<DateTime<Utc>>,
 }
@@ -76,6 +82,18 @@ pub(crate) fn is_unconfigured_error(message: &str) -> bool {
     MARKERS.iter().any(|marker| message.contains(marker))
 }
 
+/// Structured-first classification of an error value: `Unconfigured` is the
+/// calm state by construction, whatever its wording. Everything else falls
+/// back to the string MARKERS above — including every string-only context,
+/// where the variant is already lost to `TabState::Error`'s `String` by the
+/// time a report entry classifies it.
+pub fn is_unconfigured_app_error(err: &crate::error::AppError) -> bool {
+    match err {
+        crate::error::AppError::Unconfigured(_) => true,
+        other => is_unconfigured_error(&other.user_message()),
+    }
+}
+
 /// A row that carries remaining prepaid capacity: its value going to (or
 /// below) zero means the account has nothing left to spend. "Spend" rows are
 /// deliberately absent — a spend of $0 is an untouched account, not a spent
@@ -85,6 +103,114 @@ fn is_balance_row(label: &str) -> bool {
     ["balance", "available", "prepaid"]
         .iter()
         .any(|word| label.contains(word))
+}
+
+/// The headline pick shared by the report JSON, the aggregate bar tile, and
+/// (as the precomputed `headline` field) every native frontend: the fullest
+/// metric wins; with no metrics at all, the first balance-style text row
+/// stands in. `None` when nothing qualifies — frontends render their own
+/// terminal text ("Error"/"Ready") for that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadlinePick {
+    Metric(usize),
+    BalanceRow(usize),
+}
+
+/// The label words that make a TEXT row a headline candidate. `spend` is
+/// deliberately included here but not in [`is_balance_row`]: a "$0 spend"
+/// row is good news and must not mark an entry exhausted, yet it is still
+/// the figure an API-spend vendor leads with.
+fn is_headline_balance_row(label: &str) -> bool {
+    let label = label.to_lowercase();
+    ["balance", "available", "spend", "prepaid"]
+        .iter()
+        .any(|word| label.contains(word))
+}
+
+/// Select the headline row from projected `(label, percent, value)` triples.
+/// Ties keep the FIRST fullest metric, matching every frontend's fallback.
+pub(crate) fn headline_pick<'a>(
+    rows: impl Iterator<Item = (&'a str, Option<u16>, &'a str)>,
+) -> Option<HeadlinePick> {
+    let mut best: Option<(usize, u16)> = None;
+    let mut balance: Option<usize> = None;
+    for (index, (label, percent, value)) in rows.enumerate() {
+        if let Some(pct) = percent {
+            if best.is_none_or(|(_, best_pct)| pct > best_pct) {
+                best = Some((index, pct));
+            }
+        } else if balance.is_none() && !value.is_empty() && is_headline_balance_row(label) {
+            balance = Some(index);
+        }
+    }
+    best.map(|(index, _)| HeadlinePick::Metric(index))
+        .or(balance.map(HeadlinePick::BalanceRow))
+}
+
+/// The precomputed headline a frontend's tile leads with — the report JSON's
+/// `headline` field. Mirrors the local walk `omarchy/Model.js` and the KDE
+/// `plasmoid-logic.mjs` keep as their older-binary fallback.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Headline {
+    pub text: String,
+    pub percent: Option<u16>,
+    pub severity: String,
+    pub label: String,
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+/// Build the entry's [`Headline`] from its projected sections.
+fn headline_for_sections(sections: &[ReportSection]) -> Option<Headline> {
+    let pick = headline_pick(sections.iter().filter_map(|section| match section {
+        ReportSection::Metric {
+            label,
+            percent,
+            value,
+            ..
+        } => Some((label.as_str(), Some(*percent), value.as_str())),
+        ReportSection::Text { label, value } => Some((label.as_str(), None, value.as_str())),
+        _ => None,
+    }))?;
+    match pick {
+        HeadlinePick::Metric(index) => {
+            let ReportSection::Metric {
+                label,
+                percent,
+                value,
+                severity,
+                reset_at,
+                ..
+            } = &sections[index]
+            else {
+                return None;
+            };
+            Some(Headline {
+                // Same rule as every frontend's fallback: a balance-labelled
+                // metric leads with its money value, not a percentage.
+                text: if label.to_lowercase().contains("balance") && !value.is_empty() {
+                    value.clone()
+                } else {
+                    format!("{percent}%")
+                },
+                percent: Some(*percent),
+                severity: severity.clone(),
+                label: label.clone(),
+                reset_at: *reset_at,
+            })
+        }
+        HeadlinePick::BalanceRow(index) => {
+            let ReportSection::Text { label, value } = &sections[index] else {
+                return None;
+            };
+            Some(Headline {
+                text: value.clone(),
+                percent: None,
+                severity: PaceSeverity::Low.as_str().into(),
+                label: label.clone(),
+                reset_at: None,
+            })
+        }
+    }
 }
 
 /// Parse a rendered money value (`-$5.71`, `¥20.00`, `3.50 EUR`) back into a
@@ -106,7 +232,9 @@ fn balance_amount(value: &str) -> Option<f64> {
 /// the status bar once ANY reported percentage metric is at 100 — a maxed
 /// window gates usage even when the others still have room — or a balance
 /// row is at or below zero. Tabs and popups never filter on it.
-pub(crate) fn rows_exhausted<'a>(rows: impl IntoIterator<Item = (&'a str, Option<u16>, &'a str)>) -> bool {
+pub(crate) fn rows_exhausted<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<u16>, &'a str)>,
+) -> bool {
     for (label, percent, value) in rows {
         if percent.is_some_and(|pct| pct >= 100) {
             return true;
@@ -226,10 +354,11 @@ fn apply_solo_display_names(entries: &mut [Entry]) {
         if counts.get(base).copied() != Some(1) {
             continue;
         }
-        // Drop the first " · <label>" segment (a desktop marker riding in
-        // the label goes with it — a solo account is just the provider).
-        if let Some((plain, _)) = entry.display_name.split_once(" · ") {
-            entry.display_name = plain.to_string();
+        // The provider name comes from the id's vendor segment — never from
+        // splitting display_name, where a label that itself contains " · "
+        // would decide where the provider name ends.
+        if let Some(vendor) = crate::vendor::VendorId::from_slug(base) {
+            entry.display_name = vendor.display_name().to_string();
         }
     }
 }
@@ -257,6 +386,7 @@ fn entry_from_state(tab: &TabId, state: &TabState, now: chrono::DateTime<Utc>) -
             _ => false,
         },
         exhausted: false,
+        headline: None,
         stale: matches!(state, TabState::Ready(ready) if ready.stale),
         fetched_at: match state {
             TabState::Ready(ready) => ready.fetched_at,
@@ -305,7 +435,10 @@ fn entry_from_state(tab: &TabId, state: &TabState, now: chrono::DateTime<Utc>) -
         // sections a frontend renders from.
         let projected_row = match entry.sections.last() {
             Some(ReportSection::Metric {
-                label, percent, value, ..
+                label,
+                percent,
+                value,
+                ..
             }) => Some((label.as_str(), Some(*percent), value.as_str())),
             Some(ReportSection::Text { label, value }) => {
                 Some((label.as_str(), None, value.as_str()))
@@ -319,6 +452,9 @@ fn entry_from_state(tab: &TabId, state: &TabState, now: chrono::DateTime<Utc>) -
             entry.exhausted = true;
         }
     }
+    // The headline rides the same sections the frontends render from, so the
+    // precomputed pick can never disagree with them.
+    entry.headline = headline_for_sections(&entry.sections);
     entry
 }
 
@@ -393,6 +529,7 @@ fn render_json_for_primary(entries: &[Entry], primary: Option<&str>) -> String {
                 "error": entry.error,
                 "unconfigured": entry.unconfigured,
                 "exhausted": entry.exhausted,
+                "headline": entry.headline,
                 "stale": entry.stale,
                 "fetched_at": entry.fetched_at,
                 "metrics": metrics,
@@ -474,7 +611,8 @@ fn render_text(entries: &[Entry]) -> String {
                         body.push_str(&format!("    {line}\n"));
                     }
                 }
-                ReportSection::Spacer => unreachable!(),
+                // Spacers are consumed by the pending_spacer logic above.
+                ReportSection::Spacer => continue,
             }
         }
         out.push_str(&body);
@@ -486,7 +624,8 @@ fn render_text(entries: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::ReadyTab;
+    use crate::error::AppError;
+    use crate::tabs::ReadyTab;
     use crate::usage::{
         DeepseekSnapshot, KimiSnapshot, KiroSnapshot, OpenRouterSnapshot, VendorSnapshot,
     };
@@ -516,13 +655,46 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_variant_classifies_by_structure_not_wording() {
+        let reworded = "brand new remedy prose — no marker this codebase emits";
+        assert!(is_unconfigured_app_error(&AppError::Unconfigured(
+            reworded.into()
+        )));
+        // The same text as a `Credentials` error stays an alarm: only the
+        // variant is structural, the string path still needs a MARKERS hit.
+        assert!(!is_unconfigured_app_error(&AppError::Credentials(
+            reworded.into()
+        )));
+        // Non-credentials variants fall through to the string classifier.
+        assert!(!is_unconfigured_app_error(&AppError::Transport(
+            "connection refused".into()
+        )));
+        assert!(!is_unconfigured_app_error(&AppError::Http {
+            status: 401,
+            body: "unauthorized".into()
+        }));
+        // Malformed payloads change nothing: classification is variant-only,
+        // and Display prints the inner text the producer chose.
+        assert!(is_unconfigured_app_error(&AppError::Unconfigured(
+            String::new()
+        )));
+        assert!(is_unconfigured_app_error(&AppError::Unconfigured(
+            "\x1b[2Kspoof\n".into()
+        )));
+        // An empty inner still renders through the Credentials-mirroring
+        // Display — no special case, no surprise.
+        assert_eq!(
+            AppError::Unconfigured(String::new()).to_string(),
+            AppError::Credentials(String::new()).to_string()
+        );
+    }
+
+    #[test]
     fn error_entries_carry_the_unconfigured_flag() {
         let tab = TabId::vendor(VendorId::Zai);
         let e = entry_from_state(
             &tab,
-            &TabState::Error(
-                "credentials error: Zai: no API key. Either set an API key …".into(),
-            ),
+            &TabState::Error("credentials error: Zai: no API key. Either set an API key …".into()),
             Utc::now(),
         );
         assert!(e.unconfigured);
@@ -536,6 +708,7 @@ mod tests {
     }
 
     fn entry(name: &str, sections: Vec<ReportSection>) -> Entry {
+        let headline = headline_for_sections(&sections);
         Entry {
             id: name.into(),
             name: name.into(),
@@ -547,6 +720,7 @@ mod tests {
             error: None,
             unconfigured: false,
             exhausted: false,
+            headline,
             stale: false,
             fetched_at: None,
         }
@@ -678,6 +852,77 @@ mod tests {
         assert_eq!(first["metrics"][0]["severity"], "mid");
         assert!(first["metrics"][0]["reset_at"].is_null());
         assert!(value["primary"].is_null());
+    }
+
+    /// The precomputed `headline` field is what the native frontends' tiles
+    /// lead with; the rule must match their local fallbacks exactly (see
+    /// `omarchy/Model.js` and the KDE `plasmoid-logic.mjs`).
+    #[test]
+    fn json_precomputes_the_headline_figure() {
+        // Balance-labelled metric → the money value leads, not a percentage.
+        let rendered = render_json_for_primary(
+            &[entry(
+                "openrouter",
+                vec![
+                    metric("Credit balance", 87, "$1.34", "…"),
+                    metric("Spend (30d)", 10, "10%", "…"),
+                ],
+            )],
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let headline = &value["entries"][0]["headline"];
+        assert_eq!(headline["text"], "$1.34");
+        assert_eq!(headline["percent"], 87);
+        assert_eq!(headline["label"], "Credit balance");
+
+        // Quota metrics: the fullest window wins with its percentage.
+        let rendered = render_json_for_primary(
+            &[entry(
+                "claude",
+                vec![
+                    metric("Session (5h)", 62, "62%", "…"),
+                    metric("Weekly (7d)", 27, "27%", "…"),
+                ],
+            )],
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let headline = &value["entries"][0]["headline"];
+        assert_eq!(headline["text"], "62%");
+        assert_eq!(headline["percent"], 62);
+        assert_eq!(headline["severity"], "mid");
+    }
+
+    #[test]
+    fn headline_pick_rules_match_the_frontend_fallbacks() {
+        // No metrics: the first balance-style TEXT row stands in — "spend"
+        // counts here even though it never marks an entry exhausted.
+        let pick = headline_pick(
+            [
+                ("Vendor", None, "usage via API"),
+                ("Spend (30d)", None, "$12.40"),
+                ("Balance", None, "$4.00"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(pick, Some(HeadlinePick::BalanceRow(1)));
+
+        // Any metric outranks text rows; ties keep the FIRST fullest.
+        let pick = headline_pick(
+            [
+                ("Weekly", Some(40), "40%"),
+                ("Session", Some(80), "80%"),
+                ("Balance", None, "$4.00"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(pick, Some(HeadlinePick::Metric(1)));
+
+        // Nothing reportable → no headline; the frontend renders "Ready".
+        assert_eq!(headline_pick([("Vendor", None, "text")].into_iter()), None);
+        // An empty balance text row is not a headline.
+        assert_eq!(headline_pick([("Balance", None, "")].into_iter()), None);
     }
 
     #[test]
@@ -985,7 +1230,10 @@ mod tests {
         assert_eq!(entries[0].name, "kimi · 1", "machine name untouched");
         assert_eq!(entries[1].display_name, "Z.AI · 1", "siblings keep theirs");
         assert_eq!(entries[2].display_name, "Z.AI · 2");
-        assert_eq!(entries[3].display_name, "DeepSeek", "default entry unchanged");
+        assert_eq!(
+            entries[3].display_name, "DeepSeek",
+            "default entry unchanged"
+        );
 
         // A vendor with default + one numbered account is NOT solo — the
         // number still distinguishes the account from the default's tile.
@@ -1000,5 +1248,21 @@ mod tests {
         let rendered = render_json_for_primary(&[entries[0].clone()], None);
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["entries"][0]["display_name"], "Kimi");
+    }
+
+    /// The provider name for a solo entry comes from the entry id's vendor
+    /// segment, not from string-splitting display_name: a label that itself
+    /// contains the " · " separator (any free-text account label can) must
+    /// not confuse the parse. `Kimi · x · y` solo still reads "Kimi".
+    #[test]
+    fn solo_display_name_survives_a_label_containing_the_separator() {
+        let mut solo = entry("kimi · x · y", Vec::new());
+        solo.id = "kimi@x · y".into();
+        solo.display_name = "Kimi · x · y".into();
+        apply_solo_display_names(std::slice::from_mut(&mut solo));
+        assert_eq!(
+            solo.display_name, "Kimi",
+            "solo display must be the provider name from the id, not a split artifact"
+        );
     }
 }

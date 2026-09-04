@@ -3,16 +3,15 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AUTH_FAILURE_MESSAGE, AppError, Result};
+use crate::fetch;
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
 use super::types::{Usage, parse_usage};
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 const SCHEMA_ERROR: &str = "OpenCode Go usage response schema mismatch";
 
 #[derive(Debug, Clone)]
@@ -28,13 +27,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: Usage,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = fetch::FetchOutcome<Usage>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -43,68 +36,27 @@ pub async fn fetch_snapshot(
     endpoints: &Endpoints,
     ttl: Duration,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
     let target = target_key(endpoints, api_key);
-
-    if let Some(bytes) = cache.fresh_payload(ttl)?
-        && let Ok(snapshot) = parse_cache(&bytes, &target)
-    {
-        return Ok(FetchOutcome {
-            snapshot,
-            stale: false,
-            last_error: cache.read_last_error(),
-            cache_age: cache.payload_age(),
-        });
-    }
-
-    match fetch_live(client, &endpoints.usage, api_key).await {
-        Ok(snapshot) => {
-            let body = serde_json::to_vec(&serde_json::json!({
+    fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(fetch::LOCK_TIMEOUT_SECS),
+        ttl,
+        fetch_live(client, &endpoints.usage, api_key),
+        |payload| parse_cache(payload.as_bytes(), &target).ok(),
+        |snapshot| {
+            serde_json::to_string(&serde_json::json!({
                 "target": target,
-                "response": usage_repr(&snapshot),
-            }))?;
-            cache.write_payload(&body)?;
-            Ok(FetchOutcome {
-                snapshot,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(error @ AppError::Transport(_)) => fallback_or_error(cache, None, &target, error),
-        Err(AppError::Http { status, .. }) => {
-            let message = status_message(status).to_string();
-            cache.mark_stale();
-            cache.write_last_error(status, &message);
-            fallback_or_error(
-                cache,
-                Some((status, message.clone())),
-                &target,
-                AppError::Http {
-                    status,
-                    body: message,
-                },
-            )
-        }
-        Err(AppError::Schema(_)) => {
-            let message = SCHEMA_ERROR.to_string();
-            cache.mark_stale();
-            cache.write_last_error(0, &message);
-            fallback_or_error(
-                cache,
-                Some((0, message.clone())),
-                &target,
-                AppError::Schema(message),
-            )
-        }
-        Err(error) => fallback_or_error(cache, None, &target, error),
-    }
+                "response": usage_repr(snapshot),
+            }))
+            .unwrap_or_default()
+        },
+    )
+    .await
 }
 
 async fn fetch_live(client: &reqwest::Client, url: &str, api_key: &str) -> Result<Usage> {
     let response = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(url)
             .bearer_auth(api_key)
@@ -173,37 +125,6 @@ fn status_message(status: u16) -> &'static str {
         500..=599 => "OpenCode Go service is temporarily unavailable",
         _ => "OpenCode Go request failed",
     }
-}
-
-fn fallback_or_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-    error: AppError,
-) -> Result<FetchOutcome> {
-    if let Some(snapshot) = cached_outcome(cache, last_error, target)? {
-        return Ok(snapshot);
-    }
-    Err(error)
-}
-
-fn cached_outcome(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-) -> Result<Option<FetchOutcome>> {
-    let Some(body) = cache.fallback_payload(MAX_STALE)? else {
-        return Ok(None);
-    };
-    let Ok(snapshot) = parse_cache(&body, target) else {
-        return Ok(None);
-    };
-    Ok(Some(FetchOutcome {
-        snapshot,
-        stale: true,
-        last_error: last_error.or_else(|| cache.read_last_error()),
-        cache_age: cache.payload_age(),
-    }))
 }
 
 fn parse_cache(body: &[u8], target: &str) -> Result<Usage> {

@@ -5,13 +5,14 @@ import assert from 'node:assert/strict';
 import {existsSync, readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {
-    buildArgv, buildCommand, buildTuiCommand, DEFAULT_BINARY, DEFAULT_TIMEOUT_SECS,
-    detailRows, entryFor, errorMessage, EXIT_KILLED, EXIT_TIMED_OUT, formatDuration,
-    headline, isAlarming, LOGO_ASSETS, logoAssetName, MAX_TIMEOUT_SECS,
-    MIN_TIMEOUT_SECS, metricDetail, nextVendor, paletteFromTheme, panelCells,
-    parseReport, resetRemainingMs, safeText, severityColor, severityOf, SEVERITIES,
-    shellQuote, shortLabel, shouldStartFetch, TIMEOUT_KILL_GRACE_SECS,
-    timeoutSeconds, updatedAgeMs, vendorTabs,
+    buildArgv, buildCommand, buildTuiCommand, DEFAULT_BINARY, DEFAULT_TUI_BINARY,
+    DEFAULT_TIMEOUT_SECS, detailRows, entryFor, errorMessage, EXIT_KILLED,
+    EXIT_TIMED_OUT, formatDuration, headline, isAlarming, LEGACY_BINARY,
+    LEGACY_TUI_BINARY, LOGO_ASSETS, logoAssetName, MAX_TIMEOUT_SECS,
+    MIN_TIMEOUT_SECS, metricDetail, metricTone, nextVendor, paletteFromTheme,
+    panelCells, parseReport, resetRemainingMs, safeText, severityColor,
+    severityOf, SEVERITIES, shellQuote, shortLabel, shouldStartFetch,
+    TIMEOUT_KILL_GRACE_SECS, timeoutSeconds, updatedAgeMs, vendorTabs,
 } from './package/contents/code/plasmoid-logic.mjs';
 
 const at = rel => fileURLToPath(new URL(rel, import.meta.url));
@@ -93,8 +94,18 @@ for (const rel of [
     const plain = (src.match(/textFormat:\s*Text\.PlainText/g) || []).length;
     assert.equal(plain, labels, `${rel} must make every Label/Heading plain text`);
 }
-assert.match(configUi, /prober\.connectSource\(Logic\.buildCommand\(/,
+assert.match(configUi, /const cmd = Logic\.buildCommand\(/,
     'the settings probe must use the same bounded, shell-quoted command builder');
+assert.match(configUi, /function runVendorProbe\(\)/,
+    'the settings probe must be a named function so field edits can re-run it');
+assert.ok((configUi.match(/page\.runVendorProbe\(\)/g) || []).length > 1,
+    'the probe must fire on load AND again when binary-path/timeout change');
+assert.match(configUi, /onEditingFinished:\s*probeDebounce\.restart\(\)/,
+    'binary-path edits must schedule a debounced re-probe (one per committed edit)');
+assert.match(configUi, /onValueChanged:\s*probeDebounce\.restart\(\)/,
+    'timeout spinner changes must schedule a debounced re-probe');
+assert.match(configUi, /disconnectSource\(page\.lastProbeCommand\)/,
+    'a re-probe must cancel the previous command source instead of stacking spawns');
 assert.match(configUi, /text:\s*page\.labelFor\(modelData\)/,
     'the current-vendor delegate must label its string model through labelFor');
 assert.match(mainQml, /sourceName\s*!==\s*root\.pendingCommand/,
@@ -206,6 +217,19 @@ assert.equal(severityColor('critical', colors), 'C');
 assert.equal(severityColor('nonsense', colors), 'L', 'an unknown severity must not be blank');
 assert.equal(severityColor('low', undefined), undefined);
 
+// metricTone mirrors omarchy/Panel.qml's MetricRow.tone: rolling windows use
+// the remaining bands, other metrics escalate only on critical.
+const metric = (window, percent, severity) => ({type: 'metric', window, percent, severity});
+assert.equal(metricTone(metric('session', 97)), 'critical', 'under 5% remaining');
+assert.equal(metricTone(metric('weekly', 85)), 'high', 'under 20% remaining');
+assert.equal(metricTone(metric('session', 60)), 'mid', 'under 50% remaining');
+assert.equal(metricTone(metric('weekly', 30)), 'low');
+assert.equal(metricTone(metric('session', null)), '', 'no percent paints plain');
+assert.equal(metricTone(metric('', 99, 'critical')), 'critical', 'non-window critical still escalates');
+assert.equal(metricTone(metric('', 99, 'high')), '', 'non-window high stays plain');
+assert.equal(metricTone({type: 'text'}), '');
+assert.equal(metricTone(null), '');
+
 // ---------------------------------------------------------------------------
 // entry selection
 // ---------------------------------------------------------------------------
@@ -244,6 +268,24 @@ assert.equal(headline(anthropic).severity, 'critical');
 assert.equal(headline(anthropic).label, 'Weekly (7d)');
 assert.equal(headline(zai).text, 'Error');
 assert.equal(headline(null).text, '');
+
+// The Rust core precomputes the headline (report.rs `headline_pick`); when
+// present it is authoritative — the sections are not re-walked.
+const precomputed = parseReport(JSON.stringify({entries: [{
+    id: 'openrouter',
+    headline: {text: '$75.00', percent: 25, severity: 'high', label: 'Credit balance'},
+    sections: [{type: 'metric', label: 'Credit balance', percent: 25, value: '$75.00'}],
+}]})).entries[0];
+const pre = headline(precomputed);
+assert.equal(pre.text, '$75.00');
+assert.equal(pre.severity, 'high');
+assert.equal(pre.label, 'Credit balance');
+// null (nothing reportable) falls back to the local walk → "Ready".
+const noHeadline = parseReport(JSON.stringify({entries: [{
+    id: 'vendor', headline: null,
+    sections: [{type: 'text', label: 'Vendor', value: 'text'}],
+}]})).entries[0];
+assert.equal(headline(noHeadline).text, 'Ready');
 
 assert.equal(isAlarming(anthropic), true, 'a critical window is alarming');
 assert.equal(isAlarming(openai), true, 'so is stale data');
@@ -379,10 +421,24 @@ assert.ok(cmd.includes(`'/opt/my apps/ai-usagebar'`), 'a path with spaces stays 
 assert.ok(!/[;{}]/.test(cmd.replace(/'[^']*'/g, '')),
     'no shell metacharacter may appear outside a quoted span');
 
+// Empty binaryPath means "search PATH": resolve canonical-then-legacy with
+// command -v and run exactly ONE of them — an `||` fallback would re-run
+// the legacy name after a timeout on the canonical one and double the wait.
+const searchCmd = buildCommand('', 600);
+assert.ok(searchCmd.includes(`command -v '${DEFAULT_BINARY}'`),
+    'an empty path must probe the canonical name first');
+assert.ok(searchCmd.includes(`'${LEGACY_BINARY}'`),
+    'the legacy symlink name stays the fallback');
+assert.equal((searchCmd.match(/exec/g) || []).length, 2,
+    'exactly one exec per if/else arm — never both, never a re-run after ||');
+
 // The TUI launcher is the opposite case: the metacharacters ARE the point,
 // because there is no portable way to probe PATH from QML.
 assert.ok(buildTuiCommand('').includes('||'), 'the fallback chain needs its ||');
-assert.equal(buildTuiCommand('kitty -e'), `kitty -e 'ai-usagebar-tui'`);
+assert.ok(buildTuiCommand('').includes(`'${DEFAULT_TUI_BINARY}'`)
+    && buildTuiCommand('').includes(`'${LEGACY_TUI_BINARY}'`),
+    'the TUI chain covers both binary names');
+assert.equal(buildTuiCommand('kitty -e'), `kitty -e '${DEFAULT_TUI_BINARY}'`);
 assert.equal(buildTuiCommand('  '), buildTuiCommand(''), 'blank means "no custom terminal"');
 
 assert.equal(shouldStartFetch('', 'cmd'), true);

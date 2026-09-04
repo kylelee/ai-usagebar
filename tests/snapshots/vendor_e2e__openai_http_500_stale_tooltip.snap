@@ -1,0 +1,19 @@
+---
+source: tests/vendor_e2e.rs
+expression: "normalize_updated_time(&out.tooltip, outcome.cache_age)"
+---
+<span foreground='#61afef'>╭───────────────────────────────────────────────╮</span>
+<span foreground='#61afef'>│</span>                  <span font_weight='bold' foreground='#61afef'>ChatGPT Pro</span>                  <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#abb2bf'>  󰔟  Codex 5h</span>                                 <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>   <span foreground='#e5c07b'>██████████</span><span foreground='#3e4451'>░░░░░░░░░░</span>  <span font_weight='bold' foreground='#e5c07b'>50%</span>                   <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  ⏱  Resets in 2h 00m</span>                         <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#e06c75'>  󰅚  HTTP 500</span>                                 <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>     <span foreground='#5c6370'>{"error":{"message":"upstream exploded"}}</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span>                                               <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>─────────────────────────────────────────────</span> <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>│</span> <span foreground='#5c6370'>  󰅐  Updated HH:MM</span>                            <span foreground='#61afef'>│</span>
+<span foreground='#61afef'>╰───────────────────────────────────────────────╯</span>

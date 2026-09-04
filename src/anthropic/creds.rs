@@ -235,7 +235,7 @@ pub fn resolve(target: &CredsTarget) -> Result<(CredentialsFile, CredsSource)> {
 /// | any                 | **unreadable**  | the Keychain error         |
 ///
 /// The "login remedy" row turns a missing default file with no Keychain
-/// rescue into `Credentials("… run \`claude\` once …")` — that state means
+/// rescue into `Unconfigured("… run \`claude\` once …")` — that state means
 /// the CLI never logged in here, and a raw ENOENT read as a broken install.
 ///
 /// The last row matters: a *locked* login Keychain or a denied ACL is not the
@@ -278,17 +278,14 @@ fn read_default_with(
 /// with the CLI (or point `credentials_path` at a credentials file / pick a
 /// different primary). Every other file outcome (permissions, parse errors)
 /// keeps its original error.
-fn missing_default_remedy(
-    file_result: &Result<CredentialsFile>,
-    path: &Path,
-) -> Option<AppError> {
+fn missing_default_remedy(file_result: &Result<CredentialsFile>, path: &Path) -> Option<AppError> {
     let Err(AppError::Io { source, .. }) = file_result else {
         return None;
     };
     if source.kind() != std::io::ErrorKind::NotFound {
         return None;
     }
-    Some(AppError::Credentials(format!(
+    Some(AppError::Unconfigured(format!(
         "Claude: no credentials at {}. Run `claude` once to sign in — ai-usagebar-omarchy \
          reads the login the CLI stores — or set `credentials_path` under [anthropic] \
          in {}, or make another vendor the [ui] primary.",
@@ -563,14 +560,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.json");
         let err = read_default_with(&path, || Ok(None)).unwrap_err();
-        match err {
-            AppError::Credentials(message) => {
-                assert!(message.contains("missing.json"), "{message}");
-                assert!(message.contains("`claude`"), "{message}");
-                assert!(message.contains("credentials_path"), "{message}");
-            }
-            other => panic!("expected a Credentials remedy, got {other:?}"),
-        }
+        assert!(
+            matches!(err, AppError::Unconfigured(_)),
+            "expected the Unconfigured remedy, got {err:?}"
+        );
+        // Display is byte-identical to the pre-variant text (Credentials').
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "credentials error: Claude: no credentials at {}. Run `claude` once to sign in — ai-usagebar-omarchy reads the login the CLI stores — or set `credentials_path` under [anthropic] in {}, or make another vendor the [ui] primary.",
+                path.display(),
+                crate::config::config_path_hint()
+            )
+        );
+        let AppError::Unconfigured(message) = &err else {
+            panic!("expected the Unconfigured remedy, got {err:?}")
+        };
+        assert!(message.contains("missing.json"), "{message}");
+        assert!(message.contains("`claude`"), "{message}");
+        assert!(message.contains("credentials_path"), "{message}");
     }
 
     #[test]
@@ -579,7 +587,7 @@ mod tests {
         let path = dir.path().join("missing.json");
         let err = read_default_with(&path, || Ok(Some("not json".into()))).unwrap_err();
         assert!(
-            matches!(err, AppError::Credentials(ref m) if m.contains("`claude`")),
+            matches!(err, AppError::Unconfigured(ref m) if m.contains("`claude`")),
             "expected the login remedy, got {err:?}"
         );
     }

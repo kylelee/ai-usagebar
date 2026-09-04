@@ -1,3 +1,12 @@
+//! Deliberately NOT on `crate::fetch::run_cached_fetch` (todo 14 documented
+//! exception, per the todo-13 STOP criterion): `apply_persisted_oauth` and
+//! `Endpoints::for_region` run after the fresh-cache check and hard-error
+//! OUTSIDE the fallback policy (a malformed cached credential must surface,
+//! not hide behind stale data), and the `last_error` pair comes from
+//! `error_to_pair` (inner Credentials text, the kiro-specific 401/403
+//! message) rather than `write_last_error`'s redacting return — the todo-7
+//! scaffold can express neither without text/marker drift.
+//!
 //! Orchestrates a Kiro CLI snapshot: read kiro-cli's own cached AWS SSO OIDC
 //! token (`db.rs`), refresh it if it's close to expiry (`oauth.rs` — kiro-cli's
 //! own database is never written back to), persist the refreshed credential in

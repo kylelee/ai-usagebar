@@ -54,8 +54,8 @@ async fn run() -> io::Result<()> {
     let tabs = tabs_with_desktop(&config);
     if tabs.is_empty() {
         eprintln!(
-            "No vendors are enabled in {}. Exiting.",
-            ai_usagebar::config::config_path_hint()
+            "{}",
+            no_vendors_message(&ai_usagebar::config::config_path_hint())
         );
         return Ok(());
     }
@@ -145,8 +145,10 @@ fn config_stamp() -> Option<ConfigStamp> {
 /// Re-read `config.toml` into `config` and rebuild everything the TUI derives
 /// from it — the tab set (vendor + `[[anthropic.accounts]]` changes), the
 /// overview vendor list, the context toggle — then re-fetch every tab. Returns
-/// `false` and touches nothing if the file can't be parsed, so a half-written
-/// edit never wipes the session back to defaults; the next poll retries.
+/// `false` and keeps the session on the old config if the file can't be
+/// parsed, so a half-written edit never wipes the session back to defaults;
+/// the failed parse is recorded on the app's footer status and the next poll
+/// retries.
 ///
 /// `reselect_primary` snaps back to the configured primary tab — wanted right
 /// after an explicit Settings save, but not on a background file-watch reload,
@@ -159,7 +161,7 @@ fn reload_config(
     tx: &mpsc::UnboundedSender<(u64, TabId, TabState)>,
     reselect_primary: bool,
 ) -> bool {
-    let Ok(reloaded) = Config::load() else {
+    let Some(reloaded) = note_reload_result(app, Config::load()) else {
         return false;
     };
     *config = reloaded;
@@ -172,6 +174,23 @@ fn reload_config(
     }
     spawn_all(app, client, config, tx);
     true
+}
+
+/// Bookkeep the footer reload status from a `Config::load` result: a failed
+/// parse records the reason, a success clears whatever was on screen. Split
+/// from [`reload_config`] so the set-on-fail / clear-on-success state machine
+/// is unit-testable without touching the real config path.
+fn note_reload_result(app: &mut App, result: ai_usagebar::error::Result<Config>) -> Option<Config> {
+    match result {
+        Ok(config) => {
+            app.config_reload_error = None;
+            Some(config)
+        }
+        Err(e) => {
+            app.config_reload_error = Some(e.user_message());
+            None
+        }
+    }
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -484,5 +503,52 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             false
         }
         _ => false,
+    }
+}
+
+/// Pinned user-facing text for the nothing-enabled startup path.
+fn no_vendors_message(path: &str) -> String {
+    format!(
+        "No vendors are enabled in {path}. Exiting.\n\
+         Add `enabled = true` to a vendor section in {path} to enable one."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_vendors_message_suggests_enabling_a_vendor_section() {
+        let msg = no_vendors_message("/tmp/config.toml");
+        assert!(
+            msg.contains("No vendors are enabled in /tmp/config.toml. Exiting."),
+            "{msg}"
+        );
+        assert!(msg.contains("enabled = true"), "{msg}");
+        assert!(
+            msg.contains("to a vendor section in /tmp/config.toml"),
+            "{msg}"
+        );
+    }
+
+    /// The reload state machine: a failed parse sets the footer status, a
+    /// success clears it. (Runs through the pure helper — `Config::load()`
+    /// itself is not hermetic.)
+    #[test]
+    fn reload_status_is_set_on_failure_and_cleared_on_success() {
+        let mut app = App::with_theme(
+            vec![TabId::vendor(ai_usagebar::vendor::VendorId::Anthropic)],
+            ai_usagebar::theme::Theme::default(),
+        );
+
+        note_reload_result(
+            &mut app,
+            Err(ai_usagebar::error::AppError::Other("boom".into())),
+        );
+        assert_eq!(app.config_reload_error.as_deref(), Some("boom"));
+
+        note_reload_result(&mut app, Ok(Config::default()));
+        assert_eq!(app.config_reload_error, None);
     }
 }

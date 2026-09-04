@@ -70,10 +70,7 @@ fn append(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
     if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
@@ -100,10 +97,7 @@ fn rotate(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
 }

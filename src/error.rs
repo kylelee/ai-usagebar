@@ -40,6 +40,16 @@ pub enum AppError {
     #[error("credentials error: {0}")]
     Credentials(String),
 
+    /// The vendor is simply not configured yet (no key, no first login): the
+    /// routine remedy state, not a broken install. Distinct from
+    /// `Credentials` so report classification can be structural
+    /// (`report::is_unconfigured_app_error`) instead of string-matching the
+    /// remedy prose. Display mirrors `Credentials` byte-for-byte — today's
+    /// user-visible text is the spec, and report.rs's string MARKERS (the
+    /// fallback for producers not yet converted) match that prose.
+    #[error("credentials error: {0}")]
+    Unconfigured(String),
+
     /// HTTP request failed at the transport layer (DNS, TLS, timeout, connect).
     /// Maps to claudebar's "HTTP 000" — show `Loading…`, don't write
     /// `.last_error`, retry next tick.

@@ -16,6 +16,11 @@ use chrono::{DateTime, Utc};
 
 use crate::error::{AppError, Result};
 
+// Money-in-minor-units formatting lives with the other money rendering in
+// `format.rs`; re-exported here because the snapshot types below (and their
+// tests) spell it `fmt_minor`.
+pub use crate::format::{fmt_minor, fmt_minor_units};
+
 /// Reject a non-finite monetary value. A NaN or infinity reaching a balance
 /// field means the payload was not what we think it is; displaying it as money
 /// (or caching it as authoritative) is worse than failing loudly.
@@ -155,42 +160,6 @@ impl ExtraUsage {
             // zero-, three-, or four-decimal currencies by the wrong scale.
             (None, Some(currency)) => fmt_minor_units(amount.0, currency),
         }
-    }
-}
-
-fn fmt_minor_units(minor: i64, currency: &str) -> String {
-    let sign = if minor < 0 { "-" } else { "" };
-    format!("{sign}{} minor units {currency}", minor.unsigned_abs())
-}
-
-/// Format an amount in minor units with its own currency and scale. Rendering
-/// R$ 141.57 as "$141.57" is a claim about the wrong currency — the same class
-/// of defect as a fabricated number. Known codes get their symbol (mirroring
-/// `deepseek::format_money`); anything else renders as `AMOUNT CODE`, which is
-/// still truthful.
-pub fn fmt_minor(minor: i64, decimal_places: u32, currency: Option<&str>) -> String {
-    let scale = 10_u64.pow(decimal_places);
-    // `unsigned_abs`, not negation: `-i64::MIN` overflows. Unreachable from
-    // the wire (the parse gate rejects negatives) but this is a pub fn.
-    let sign = if minor < 0 { "-" } else { "" };
-    let abs = minor.unsigned_abs();
-    let number = if decimal_places == 0 {
-        format!("{abs}")
-    } else {
-        format!(
-            "{}.{:0width$}",
-            abs / scale,
-            abs % scale,
-            width = decimal_places as usize
-        )
-    };
-    match currency {
-        None | Some("USD") => format!("{sign}${number}"),
-        Some("BRL") => format!("{sign}R${number}"),
-        Some("EUR") => format!("{sign}€{number}"),
-        Some("GBP") => format!("{sign}£{number}"),
-        Some("JPY") | Some("CNY") => format!("{sign}¥{number}"),
-        Some(other) => format!("{sign}{number} {other}"),
     }
 }
 
@@ -411,13 +380,23 @@ pub struct AnthropicApiSnapshot {
 
 impl Eq for AnthropicApiSnapshot {}
 
+/// Spend as an integer percentage of `limit`; `None` when the limit is not a
+/// finite positive number. Shared by every spend-vs-configured-limit snapshot
+/// (Anthropic API, OpenAI API) so the two gauges cannot drift apart: over-limit
+/// spend may exceed 100%, but a pathological limit is clamped to 9999.
+pub fn spend_pct(spent: f64, limit: f64) -> Option<i32> {
+    if limit.is_finite() && limit > 0.0 {
+        Some(((spent / limit) * 100.0).round().clamp(0.0, 9999.0) as i32)
+    } else {
+        None
+    }
+}
+
 impl AnthropicApiSnapshot {
     /// Spend as an integer percentage of the configured limit; `None` when no
     /// positive limit is set.
     pub fn pct(&self) -> Option<i32> {
-        self.limit
-            .filter(|l| l.is_finite() && *l > 0.0)
-            .map(|l| ((self.spent / l) * 100.0).round().clamp(0.0, 9999.0) as i32)
+        self.limit.and_then(|l| spend_pct(self.spent, l))
     }
 }
 
@@ -439,9 +418,7 @@ impl OpenAiApiSnapshot {
     /// Spend as an integer percentage of the configured limit; `None` when no
     /// positive limit is set.
     pub fn pct(&self) -> Option<i32> {
-        self.limit
-            .filter(|l| l.is_finite() && *l > 0.0)
-            .map(|l| ((self.spent / l) * 100.0).round().clamp(0.0, 9999.0) as i32)
+        self.limit.and_then(|l| spend_pct(self.spent, l))
     }
 }
 
@@ -724,6 +701,59 @@ mod tests {
         assert_eq!(fmt_minor(-150, 2, Some("BRL")), "-R$1.50");
         // Unknown code stays truthful as a suffix rather than guessing a symbol.
         assert_eq!(fmt_minor(1234, 2, Some("CHF")), "12.34 CHF");
+    }
+
+    /// The shared spend gauge keeps both former `pct()` impls' semantics
+    /// byte-for-byte: over-limit spend is honest (200% of the limit prints
+    /// 200), a pathological limit still clamps at 9999, and a limit that is
+    /// not finite-and-positive yields no gauge at all.
+    #[test]
+    fn spend_pct_mirrors_the_former_pct_impls() {
+        assert_eq!(spend_pct(5.0, 10.0), Some(50));
+        assert_eq!(spend_pct(20.0, 10.0), Some(200));
+        // 9999 is the clamp ceiling, preserved from `clamp(0.0, 9999.0)`.
+        assert_eq!(spend_pct(100.0, 1.0), Some(9999));
+        assert_eq!(spend_pct(0.0, 10.0), Some(0));
+        // No positive finite limit → no gauge (limit 0, negative, NaN, inf).
+        assert_eq!(spend_pct(5.0, 0.0), None);
+        assert_eq!(spend_pct(5.0, -10.0), None);
+        assert_eq!(spend_pct(5.0, f64::NAN), None);
+        assert_eq!(spend_pct(5.0, f64::INFINITY), None);
+        // A non-finite SPENT is not a limit problem: Rust's saturating float
+        // cast turns NaN into 0, exactly as the pre-dedup impls did.
+        assert_eq!(spend_pct(f64::NAN, 10.0), Some(0));
+    }
+
+    #[test]
+    fn api_snapshot_pcts_route_through_spend_pct() {
+        let anthropic = AnthropicApiSnapshot {
+            spent: 40.0,
+            limit: Some(20.0),
+        };
+        assert_eq!(anthropic.pct(), Some(200));
+        assert_eq!(
+            AnthropicApiSnapshot {
+                spent: 40.0,
+                limit: Some(0.0),
+            }
+            .pct(),
+            None
+        );
+        assert_eq!(
+            AnthropicApiSnapshot {
+                spent: 40.0,
+                limit: None,
+            }
+            .pct(),
+            None
+        );
+        let openai = OpenAiApiSnapshot {
+            spent: 100.0,
+            by_day: vec![],
+            top_items: vec![],
+            limit: Some(1.0),
+        };
+        assert_eq!(openai.pct(), Some(9999));
     }
 
     #[test]

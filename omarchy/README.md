@@ -35,10 +35,10 @@ omarchy plugin disable omarchy.agents
 
 That's it — the bar immediately tiles every configured account. Nothing is
 configured yet? Open the bar panel (click the icon) → gear (`s`) →
-**ACCOUNTS** → **Add account** → pick the provider (Z.AI / Kimi) → paste the
-API key (the name is pre-filled, editable) → **Apply**. Z.AI team keys also
-select the `team` billing type and paste the two organization ids; everything
-else (site, region) is auto-detected.
+**ACCOUNTS** → pick a vendor's **Add … Account** button → paste the API key →
+**Apply**. Accounts are auto-named by position — the key is the only thing to
+type. Z.AI team keys also select the `team` billing type and paste the two
+organization ids; everything else (site, region) is auto-detected.
 
 No config file needs to be written by hand, but one appears anyway: the first
 run drops a fully commented template at `~/.config/ai-usagebar-omarchy/config.toml`
@@ -61,8 +61,9 @@ omarchy plugin remove ai-usagebar-omarchy
   in the widget's inline `shell.json` settings and restored after shell reloads
   and sleep/unlock cycles. Right-click is not the settings shortcut.
 - Bar tiles: every account that reads successfully is always shown side by
-  side — the name you gave it (or the provider name for unnamed defaults),
-  the 5h and weekly windows each with its own reset countdown
+  side — the account's name (auto-assigned 1, 2, … for key vendors, or the
+  provider name for a vendor's lone default), the 5h and weekly windows each
+  with its own reset countdown
   (`kimi-main 42%·2h 05m 15%·2d 3h`). Each figure is its own Text object colored
   by ITS window's remaining band — green ≥50% remaining, yellow <50%,
   orange <20%, red <5% — so a green 5h figure can sit beside an orange
@@ -99,25 +100,30 @@ rather than argv or the environment. Leave a field blank to keep its current
 value, or use its clear button to remove an inline key. Saving a new key also
 enables that provider, matching the terminal overlay.
 
-**ACCOUNTS** manages every Z.AI and Kimi key as its own card — one bar tile
-per account, its name the tile tag:
+**ACCOUNTS** manages every key-based vendor's keys as account cards, grouped
+by provider — one bar tile per account:
 
-- **Add account** creates a draft; pick the provider (Z.AI / Kimi), the name
-  is pre-filled (`Z.AI`, `Kimi`, `Z.AI 2`, …) and freely editable, the API
-  key field comes last, and the card's own **Apply** saves it.
+- Each vendor group carries its own **Add … Account** button. A new card asks
+  for just the API key: accounts are auto-named 1, 2, … by their position in
+  the group — there is no name field, and the number doubles as the
+  `--account N` selector. Hand-written legacy `label` keys are ignored (and
+  cleaned out of `config.toml` the next time the form saves that vendor).
+- The plain **API KEYS** section is gone: every key — a vendor's default or
+  an extra one — is an account card now, including Anthropic API and OpenAI
+  API. Those two Admin-spend vendors add an optional **monthly limit** field
+  per card, reported against in the panel.
 - Z.AI cards pick the **billing type** (`personal` / `team` / `usage`).
   `team` is the enterprise subscription: it queries bigmodel.cn with
   `?type=2` and asks for the two organization ids (bigmodel.cn console →
   F12 → Application → Local Storage), which only appear for team keys.
   `usage` is a pay-as-you-go key (7-day stats only). The site
   (z.ai / bigmodel.cn) is auto-detected from the type — nothing to choose.
-- Kimi cards take just a name and a key; region and deployment stay
-  auto-detected.
-- Every card carries its own **Apply**; rename in place, reset the key, or
-  delete the account from the card header. Naming the default account moves
-  its key into a named account in one step.
-- Misconfigured accounts show their remedy inline and never alarm the bar;
-  a name collision is flagged the moment you type it.
+- Kimi cards take just a key; region and deployment stay auto-detected.
+- Every card carries its own **Apply**; reset the key, adjust its monthly
+  limit, or delete the account from the card header.
+- Misconfigured accounts show their remedy inline and never alarm the bar.
+  Local-session vendors (Antigravity, Cursor, Kiro, SuperGrok) stay
+  single-account by nature.
 
 Closing the panel (focus loss, clicking elsewhere) preserves everything you
 typed plus the scroll position — reopen and continue exactly where you left

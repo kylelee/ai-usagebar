@@ -166,6 +166,22 @@ pub enum SettingsAction {
     Apply,
 }
 
+/// The renderer-facing projection of the CLI's presentation flags. Lives next
+/// to `Cli` (whose fields it mirrors one-for-one) rather than in `vendor.rs`,
+/// keeping the vendor core free of the CLI surface.
+impl From<&Cli> for crate::vendor::RenderOpts {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            format: cli.format.clone(),
+            tooltip_format: cli.tooltip_format.clone(),
+            icon: cli.icon.clone(),
+            pace_tolerance: cli.pace_tolerance,
+            format_pace_color: cli.format_pace_color,
+            tooltip_pace_pts: cli.tooltip_pace_pts,
+        }
+    }
+}
+
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum AccountAction {
     /// Register an isolated account and open Claude Code to sign it in.
@@ -470,7 +486,14 @@ mod tests {
         ));
 
         assert!(
-            Cli::try_parse_from(["ai-usagebar-omarchy", "--vendor", "kimi", "settings", "show",]).is_err()
+            Cli::try_parse_from([
+                "ai-usagebar-omarchy",
+                "--vendor",
+                "kimi",
+                "settings",
+                "show",
+            ])
+            .is_err()
         );
     }
 
@@ -498,7 +521,13 @@ mod tests {
 
     #[test]
     fn account_add_subcommand_parses_without_widget_flags() {
-        let cli = Cli::parse_from(["ai-usagebar-omarchy", "account", "add", "work", "--no-login"]);
+        let cli = Cli::parse_from([
+            "ai-usagebar-omarchy",
+            "account",
+            "add",
+            "work",
+            "--no-login",
+        ]);
         assert!(matches!(
             cli.command,
             Some(Command::Account {
@@ -550,14 +579,27 @@ mod tests {
         );
         // --email / -y only mean something for the Desktop capture.
         assert!(
-            Cli::try_parse_from(["ai-usagebar-omarchy", "account", "add", "w", "--email", "a@b.test"])
-                .is_err()
+            Cli::try_parse_from([
+                "ai-usagebar-omarchy",
+                "account",
+                "add",
+                "w",
+                "--email",
+                "a@b.test"
+            ])
+            .is_err()
         );
     }
 
     #[test]
     fn account_switch_defaults_to_both_surfaces() {
-        let cli = Cli::parse_from(["ai-usagebar-omarchy", "account", "switch", "work", "--dry-run"]);
+        let cli = Cli::parse_from([
+            "ai-usagebar-omarchy",
+            "account",
+            "switch",
+            "work",
+            "--dry-run",
+        ]);
         assert!(matches!(
             cli.command,
             Some(Command::Account {

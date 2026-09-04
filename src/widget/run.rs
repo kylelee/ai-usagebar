@@ -2,7 +2,7 @@
 //! snapshot, renders the right output mode, and prints. Catches every error
 //! into a fallback `⚠` JSON / pretty line so Waybar never hides the module.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,7 +10,6 @@ use reqwest::Client;
 
 use crate::anthropic::{self, creds::CredsTarget, fetch::FetchOutcome};
 use crate::anthropic_api;
-use crate::openai_api;
 use crate::antigravity;
 use crate::cache::{Cache, DEFAULT_TTL};
 use crate::config::Config;
@@ -25,6 +24,7 @@ use crate::minimax;
 use crate::moonshot;
 use crate::novita;
 use crate::openai;
+use crate::openai_api;
 use crate::openrouter;
 use crate::pango::escape;
 use crate::supergrok;
@@ -43,11 +43,29 @@ pub async fn run(cli: Cli) -> i32 {
     if cli.cycle_next || cli.cycle_prev {
         return run_cycle(&cli).await;
     }
+    // First-run template notice, pretty terminals only: Waybar's JSON exec,
+    // piped output, and `--watch` into a file must stay byte-stable.
+    if !cli.output_json() && std::io::stdout().is_terminal() {
+        let note = Config::load_with_note().ok().and_then(|(_, note)| note);
+        note_template_seed(&mut std::io::stderr().lock(), note.as_deref());
+    }
     if let Some(secs) = cli.watch {
         return run_watch(cli, secs).await;
     }
     run_once(&cli, &mut std::io::stdout()).await;
     0
+}
+
+/// Tell the user where the freshly seeded template landed. The path is
+/// sanitized at the sink — config paths can carry account-derived components.
+fn note_template_seed(err: &mut impl Write, note: Option<&std::path::Path>) {
+    if let Some(path) = note {
+        let _ = writeln!(
+            err,
+            "created config template at {}",
+            crate::display::sanitize_untrusted_path(path)
+        );
+    }
 }
 
 /// Cycle to the next/prev enabled vendor and signal waybar to refresh.
@@ -92,6 +110,33 @@ fn should_clear_screen(stdout_is_tty: bool) -> bool {
     stdout_is_tty
 }
 
+/// The `--watch` hint belongs to the same terminal the screen clear repaints;
+/// a piped `--watch` must not grow a line per interval. Split from the loop so
+/// the gate is testable without a pty.
+fn emit_watch_hint(err: &mut impl Write, gated: bool, secs: u64) {
+    if gated {
+        let _ = writeln!(err, "(re-rendering every {secs}s — press Ctrl-C to exit)");
+    }
+}
+
+/// One stderr warning naming each `{[a-z_]+}` token that survived
+/// substitution in the pretty bar text. `gated: false` is a no-op — JSON and
+/// piped consumers get byte-stable output; split from the call site so the
+/// gate is testable without a pty.
+fn emit_pretty_warning(err: &mut impl Write, gated: bool, bar_text: &str) {
+    if !gated {
+        return;
+    }
+    let unknown = crate::format::unrecognized_placeholders(bar_text);
+    if !unknown.is_empty() {
+        let _ = writeln!(
+            err,
+            "warning: unrecognized placeholders: {}",
+            unknown.join(", ")
+        );
+    }
+}
+
 async fn run_watch(cli: Cli, secs: u64) -> i32 {
     let interval = Duration::from_secs(secs.max(1));
     let clear = {
@@ -106,7 +151,7 @@ async fn run_watch(cli: Cli, secs: u64) -> i32 {
         let _ = std::io::stdout().flush();
         run_once(&cli, &mut std::io::stdout()).await;
         println!();
-        eprintln!("(re-rendering every {secs}s — press Ctrl-C to exit)");
+        emit_watch_hint(&mut std::io::stderr().lock(), clear, secs);
         tokio::select! {
             _ = tokio::time::sleep(interval) => continue,
             _ = tokio::signal::ctrl_c() => return 0,
@@ -130,6 +175,14 @@ async fn run_once(cli: &Cli, out: &mut impl Write) {
         let _ = out.write_all(output.to_json_line().as_bytes());
     } else {
         let _ = print_pretty(out, &output);
+        // A typo'd `{sesson_pct}` prints literally today; tell a human which
+        // names failed to resolve. TTY-gated like the watch hint — a piped or
+        // JSON run must not grow a stderr line.
+        emit_pretty_warning(
+            &mut std::io::stderr().lock(),
+            std::io::stdout().is_terminal(),
+            &output.text,
+        );
     }
     let _ = out.flush();
 }
@@ -148,11 +201,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
     }
     validate_vendor_options(cli, vendor)?;
     if !dispatch_is_eligible(cli, &config, vendor) {
-        return Err(AppError::Other(format!(
-            "vendor {:?} is disabled in {}",
-            vendor,
-            crate::config::config_path_hint()
-        )));
+        return Err(disabled_vendor_error(vendor));
     }
     match vendor {
         // `all` never reaches the dispatch: build_output handled it above.
@@ -177,6 +226,16 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Kiro => kiro_output(cli, &config).await,
         Vendor::OpenCodeGo => opencode_go_output(cli, &config).await,
     }
+}
+
+/// Pinned user-facing text; the section name must match config.rs's own hints.
+fn disabled_vendor_error(vendor: Vendor) -> AppError {
+    let section = vendor.to_id().map_or("all", |id| id.slug());
+    AppError::Other(format!(
+        "vendor {:?} is disabled in {}. Add `enabled = true` under [{section}]",
+        vendor,
+        crate::config::config_path_hint()
+    ))
 }
 
 fn validate_vendor_options(cli: &Cli, vendor: Vendor) -> Result<()> {
@@ -217,6 +276,40 @@ fn dispatch_is_eligible(cli: &Cli, config: &Config, vendor: Vendor) -> bool {
     cli.has_explicit_vendor() || vendor.to_id().is_some_and(|id| config.is_enabled(id))
 }
 
+/// One vendor's fetch → render pipeline. A transient failure maps to the
+/// calm `loading` output (Waybar keeps the module visible), any other error
+/// propagates to the `⚠` fallback, and success renders through the vendor's
+/// own `render` with the CLI's theme and options — the ten lines every
+/// `*_output` below used to copy.
+async fn fetch_and_render<O>(
+    cli: &Cli,
+    fetch: impl std::future::Future<Output = Result<O>>,
+    render: fn(
+        &VendorOutcome,
+        &O::Snapshot,
+        &Theme,
+        &RenderOpts,
+        chrono::DateTime<Utc>,
+    ) -> WaybarOutput,
+) -> Result<WaybarOutput>
+where
+    O: crate::vendor::VendorFetchOutcome,
+{
+    let outcome = match fetch.await {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+    let (vendor_outcome, snap) = outcome.into_parts();
+    Ok(render(
+        &vendor_outcome,
+        &snap,
+        &theme_from_cli(cli),
+        &RenderOpts::from(cli),
+        Utc::now(),
+    ))
+}
+
 async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let api_key = key_account_api_key(
         cli,
@@ -230,30 +323,18 @@ async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     let client = http_client()?;
     let cache = account_cache(cli, "opencode-go", cli.account.as_deref())?;
     let endpoints = crate::opencode_go::fetch::Endpoints::default();
-    let outcome = match crate::opencode_go::fetch::fetch_snapshot(
-        &client,
-        &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
+    fetch_and_render(
+        cli,
+        crate::opencode_go::fetch::fetch_snapshot(
+            &client,
+            &api_key,
+            &cache,
+            &endpoints,
+            DEFAULT_TTL,
+        ),
+        crate::opencode_go::vendor::render,
     )
     .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) if error.is_transient() => {
-            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
-        }
-        Err(error) => return Err(error),
-    };
-    let snapshot = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    Ok(crate::opencode_go::vendor::render(
-        &vendor_outcome,
-        &snapshot,
-        &theme_from_cli(cli),
-        &RenderOpts::from_cli(cli),
-        Utc::now(),
-    ))
 }
 
 /// Antigravity authenticates through whichever local product is running (the
@@ -261,23 +342,12 @@ async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
 async fn antigravity_output(cli: &Cli, _config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = vendor_cache(cli, "antigravity")?;
-    let outcome = match antigravity::fetch_snapshot(&client, &cache, DEFAULT_TTL).await {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(antigravity::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        antigravity::fetch_snapshot(&client, &cache, DEFAULT_TTL),
+        antigravity::vendor::render,
+    )
+    .await
 }
 
 /// Cursor authenticates via a session token the Cursor IDE already wrote to
@@ -296,32 +366,19 @@ async fn cursor_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         None => cursor::db::default_agent_auth_path()?,
     };
     let endpoints = cursor::fetch::Endpoints::default();
-    let outcome = match cursor::fetch_snapshot(
-        &client,
-        &db_path,
-        &agent_auth_path,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
+    fetch_and_render(
+        cli,
+        cursor::fetch_snapshot(
+            &client,
+            &db_path,
+            &agent_auth_path,
+            &cache,
+            &endpoints,
+            DEFAULT_TTL,
+        ),
+        cursor::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(cursor::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 /// Kiro CLI authenticates via the AWS SSO OIDC session kiro-cli already wrote
@@ -334,23 +391,12 @@ async fn kiro_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         Some(p) => p.to_path_buf(),
         None => kiro::db::default_db_path()?,
     };
-    let outcome = match kiro::fetch_snapshot(&client, &db_path, &cache, DEFAULT_TTL).await {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(kiro::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        kiro::fetch_snapshot(&client, &db_path, &cache, DEFAULT_TTL),
+        kiro::vendor::render,
+    )
+    .await
 }
 
 async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -366,32 +412,19 @@ async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "grok", cli.account.as_deref())?;
     let endpoints = grok::fetch::Endpoints::default();
-    let outcome = match grok::fetch_snapshot(
-        &client,
-        &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.grok.team_id.as_deref(),
+    fetch_and_render(
+        cli,
+        grok::fetch_snapshot(
+            &client,
+            &api_key,
+            &cache,
+            &endpoints,
+            DEFAULT_TTL,
+            config.grok.team_id.as_deref(),
+        ),
+        grok::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(grok::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 /// SuperGrok delegates auth and billing transport to the official Grok Build
@@ -403,30 +436,17 @@ async fn supergrok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         config.supergrok.auth_path.as_deref(),
         config.supergrok.config_path.as_deref(),
     )?;
-    let outcome = match supergrok::fetch_snapshot(
-        &config.supergrok.grok_binary,
-        &scope_paths,
-        &cache,
-        DEFAULT_TTL,
+    fetch_and_render(
+        cli,
+        supergrok::fetch_snapshot(
+            &config.supergrok.grok_binary,
+            &scope_paths,
+            &cache,
+            DEFAULT_TTL,
+        ),
+        supergrok::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(supergrok::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 async fn moonshot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -442,32 +462,12 @@ async fn moonshot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "moonshot", cli.account.as_deref())?;
     let (endpoints, currency) = moonshot::fetch::Endpoints::for_region(&config.moonshot.region);
-    let outcome = match moonshot::fetch_snapshot(
-        &client,
-        &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        currency,
+    fetch_and_render(
+        cli,
+        moonshot::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL, currency),
+        moonshot::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(moonshot::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 async fn minimax_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -483,24 +483,12 @@ async fn minimax_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "minimax", cli.account.as_deref())?;
     let endpoints = minimax::fetch::Endpoints::for_region(&config.minimax.region);
-    let outcome =
-        match minimax::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(minimax::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        minimax::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL),
+        minimax::vendor::render,
+    )
+    .await
 }
 
 async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -516,24 +504,12 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "novita", cli.account.as_deref())?;
     let endpoints = novita::fetch::Endpoints::default();
-    let outcome =
-        match novita::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(novita::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        novita::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL),
+        novita::vendor::render,
+    )
+    .await
 }
 
 async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -549,32 +525,19 @@ async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "kilo", cli.account.as_deref())?;
     let endpoints = kilo::fetch::Endpoints::default();
-    let outcome = match kilo::fetch_snapshot(
-        &client,
-        &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.kilo.organization_id.as_deref(),
+    fetch_and_render(
+        cli,
+        kilo::fetch_snapshot(
+            &client,
+            &api_key,
+            &cache,
+            &endpoints,
+            DEFAULT_TTL,
+            config.kilo.organization_id.as_deref(),
+        ),
+        kilo::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(kilo::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 async fn openai_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -600,29 +563,19 @@ async fn openai_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         None => config.openai_api.monthly_limit,
     };
     let endpoints = openai_api::fetch::Endpoints::default();
-    let outcome = match openai_api::fetch_snapshot(
-        &client,
-        &key,
-        &cache,
-        &endpoints,
-        crate::cache::GENTLE_TTL,
-        limit,
+    fetch_and_render(
+        cli,
+        openai_api::fetch_snapshot(
+            &client,
+            &key,
+            &cache,
+            &endpoints,
+            crate::cache::GENTLE_TTL,
+            limit,
+        ),
+        openai_api::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-    let snapshot = outcome.snapshot.clone();
-    let vendor_outcome: crate::vendor::VendorOutcome = outcome.into();
-    Ok(openai_api::vendor::render(
-        &vendor_outcome,
-        &snapshot,
-        &theme_from_cli(cli),
-        &RenderOpts::from_cli(cli),
-        chrono::Utc::now(),
-    ))
 }
 
 async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -640,7 +593,6 @@ async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput
     )?;
     let client = http_client()?;
     let cache = account_cache(cli, "anthropic_api", cli.account.as_deref())?;
-    let endpoints = anthropic_api::fetch::Endpoints::default();
     let limit = match cli.account.as_deref().and_then(|label| {
         config
             .key_accounts(crate::vendor::VendorId::AnthropicApi)
@@ -649,32 +601,13 @@ async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput
         Some(account) => account.monthly_limit.or(config.anthropic_api.monthly_limit),
         None => config.anthropic_api.monthly_limit,
     };
-    let outcome = match anthropic_api::fetch_snapshot(
-        &client,
-        &key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        limit,
+    let endpoints = anthropic_api::fetch::Endpoints::default();
+    fetch_and_render(
+        cli,
+        anthropic_api::fetch_snapshot(&client, &key, &cache, &endpoints, DEFAULT_TTL, limit),
+        anthropic_api::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(anthropic_api::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 /// Resolve a Codex login and its cache as one identity, the way
@@ -697,25 +630,25 @@ async fn openai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let (creds_path, cache) = openai_target(cli, config)?;
     let endpoints = openai::fetch::Endpoints::default();
-    let outcome =
-        match openai::fetch_snapshot(&client, &creds_path, &cache, &endpoints, crate::cache::GENTLE_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(openai::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        openai::fetch_snapshot(
+            &client,
+            &creds_path,
+            &cache,
+            &endpoints,
+            crate::cache::GENTLE_TTL,
+        ),
+        openai::vendor::render,
+    )
+    .await
 }
+
+/// Global refresh budget for one `--vendor all` pass, from loop start.
+/// Fetches are sequential and each can wait out its per-vendor HTTP timeout
+/// (5s antigravity / 10s default / 15s admin-API), so a cold start with many
+/// tabs could otherwise stall the bar for minutes.
+const AGGREGATE_DEADLINE_SECS: u64 = 45;
 
 /// `--vendor all`: every enabled vendor and account, tiled in one module.
 /// Fetches sequentially through the shared per-vendor caches (the report's
@@ -731,19 +664,64 @@ async fn all_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         )));
     }
     let client = http_client()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(AGGREGATE_DEADLINE_SECS);
+    let entries = aggregate_entries_with_deadline(&tabs, deadline, |tab| {
+        let client = &client;
+        async move { crate::tui::app::refresh_one(client, config, &tab).await }
+    })
+    .await;
+    Ok(crate::widget::aggregate::render(
+        &entries,
+        &theme_from_cli(cli),
+        &RenderOpts::from(cli),
+        Utc::now(),
+    ))
+}
+
+/// The `--vendor all` per-tab loop, extracted so the deadline logic is
+/// unit-testable with injected fetches: the tabs are refreshed sequentially,
+/// each refresh wrapped in `tokio::time::timeout(remaining_budget)` where
+/// remaining_budget = deadline − now. Once the deadline has passed,
+/// un-started tabs are never live-fetched — they render
+/// [`deferred_tab_state`] instead of stalling the bar.
+async fn aggregate_entries_with_deadline<F, Fut>(
+    tabs: &[crate::tui::app::TabId],
+    deadline: std::time::Instant,
+    fetch: F,
+) -> Vec<crate::widget::aggregate::AggregateEntry>
+where
+    F: Fn(crate::tui::app::TabId) -> Fut,
+    Fut: std::future::Future<Output = crate::tui::app::TabState>,
+{
     let now = Utc::now();
     let mut entries = Vec::with_capacity(tabs.len());
-    for tab in &tabs {
-        let state = crate::tui::app::refresh_one(&client, config, tab).await;
+    for tab in tabs {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let state = if remaining.is_zero() {
+            deferred_tab_state(tab)
+        } else {
+            match tokio::time::timeout(remaining, fetch(tab.clone())).await {
+                Ok(state) => state,
+                Err(_budget_spent) => deferred_tab_state(tab),
+            }
+        };
         entries.push(crate::widget::aggregate::AggregateEntry::from_tab(
             tab, &state, now,
         ));
     }
-    Ok(crate::widget::aggregate::render(
-        &entries,
-        &theme_from_cli(cli),
-        &RenderOpts::from_cli(cli),
-        Utc::now(),
+    entries
+}
+
+/// State for a tab the deadline cut off. There is no public cache-only
+/// payload→snapshot seam (every vendor's `parse_cache` is private to its
+/// module), so a deferred tab cannot rebuild its on-disk snapshot here
+/// without duplicating tui::app's whole per-vendor dispatch; it states
+/// plainly that it was not checked — the popup keeps the row visible and
+/// the next refresh cycle re-fetches it normally.
+fn deferred_tab_state(tab: &crate::tui::app::TabId) -> crate::tui::app::TabState {
+    crate::tui::app::TabState::Error(format!(
+        "⚠ {} not checked (cold start deadline)",
+        tab.vendor.short_name()
     ))
 }
 
@@ -756,64 +734,31 @@ async fn zai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "zai", cli.account.as_deref())?;
     let endpoints = zai::fetch::Endpoints::for_site(plan.site);
-    let outcome = match zai::fetch::fetch_snapshot_plan(
-        &client,
-        &plan,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        chrono::Utc::now(),
+    fetch_and_render(
+        cli,
+        zai::fetch::fetch_snapshot_plan(
+            &client,
+            &plan,
+            &cache,
+            &endpoints,
+            DEFAULT_TTL,
+            chrono::Utc::now(),
+        ),
+        zai::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(zai::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = openrouter_target(cli, config)?;
     let client = http_client()?;
     let endpoints = openrouter::fetch::Endpoints::default();
-    let outcome = match openrouter::fetch_snapshot(
-        &client,
-        &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
+    fetch_and_render(
+        cli,
+        openrouter::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL),
+        openrouter::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(openrouter::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 /// Resolve an OpenRouter key and its cache as one identity. The unnamed key
@@ -875,72 +820,46 @@ async fn deepseek_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let cache = account_cache(cli, "deepseek", cli.account.as_deref())?;
     let endpoints = deepseek::fetch::Endpoints::default();
-    let outcome =
-        match deepseek::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(deepseek::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
+    fetch_and_render(
+        cli,
+        deepseek::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL),
+        deepseek::vendor::render,
+    )
+    .await
 }
 
 async fn kimi_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (auth, endpoints) = kimi::resolve_auth_for(&config.kimi, cli.account.as_deref())?;
     let client = http_client()?;
     let cache = account_cache(cli, "kimi", cli.account.as_deref())?;
-    let outcome = match kimi::fetch::fetch_snapshot_with_auth(
-        &client,
-        &auth,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
+    fetch_and_render(
+        cli,
+        kimi::fetch::fetch_snapshot_with_auth(&client, &auth, &cache, &endpoints, DEFAULT_TTL),
+        kimi::vendor::render,
     )
     .await
-    {
-        Ok(o) => o,
-        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-        Err(e) => return Err(e),
-    };
-
-    let theme = theme_from_cli(cli);
-    let snap = outcome.snapshot.clone();
-    let vendor_outcome: VendorOutcome = outcome.into();
-    let opts = RenderOpts::from_cli(cli);
-    Ok(kimi::vendor::render(
-        &vendor_outcome,
-        &snap,
-        &theme,
-        &opts,
-        chrono::Utc::now(),
-    ))
 }
 
 async fn anthropic_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let (creds_target, cache) = anthropic_target(cli, config)?;
     let endpoints = anthropic::fetch::Endpoints::default();
-    let outcome =
-        match anthropic::fetch_snapshot(&client, &creds_target, &cache, &endpoints, crate::cache::GENTLE_TTL)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => {
-                // Mirror claudebar's `loading_network` path.
-                return Ok(WaybarOutput::loading(cli.icon.as_deref()));
-            }
-            Err(e) => return Err(e),
-        };
+    let outcome = match anthropic::fetch_snapshot(
+        &client,
+        &creds_target,
+        &cache,
+        &endpoints,
+        crate::cache::GENTLE_TTL,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => {
+            // Mirror claudebar's `loading_network` path.
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
 
@@ -1052,7 +971,7 @@ fn theme_from_cli(cli: &Cli) -> Theme {
 /// Fallback output when everything goes wrong — always renders a `⚠` widget.
 fn fallback(err: &AppError, _cli: &Cli) -> WaybarOutput {
     let tooltip = match err {
-        AppError::Credentials(m) => format!("Credentials error.\n{m}"),
+        AppError::Credentials(m) | AppError::Unconfigured(m) => format!("Credentials error.\n{m}"),
         AppError::Http { status, .. } if matches!(status, 401 | 403) => {
             format!("HTTP {status}\n{}", crate::error::AUTH_FAILURE_MESSAGE)
         }
@@ -1142,6 +1061,60 @@ mod tests {
     }
 
     #[test]
+    fn watch_hint_is_silent_when_the_tty_gate_is_closed() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_watch_hint(&mut buf, false, 5);
+        assert!(buf.is_empty(), "piped --watch must not grow stderr");
+    }
+
+    #[test]
+    fn watch_hint_names_ctrl_c_when_gated() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_watch_hint(&mut buf, true, 5);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Ctrl-C"), "{out}");
+        assert!(out.contains("every 5s"), "{out}");
+    }
+
+    #[test]
+    fn placeholder_warning_is_silent_when_the_tty_gate_is_closed() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_pretty_warning(&mut buf, false, "{sesson_pct} 42%");
+        assert!(buf.is_empty(), "non-TTY runs must not warn");
+    }
+
+    #[test]
+    fn placeholder_warning_names_only_the_unknown_tokens_when_gated() {
+        // Post-substitution text: the known key already became "42%" in the
+        // bar text, so the warning names only the unknown token — deduplicated,
+        // one line.
+        let mut buf: Vec<u8> = Vec::new();
+        emit_pretty_warning(&mut buf, true, "{sesson_pct} 42% {sesson_pct}");
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "warning: unrecognized placeholders: {sesson_pct}\n");
+    }
+
+    #[test]
+    fn placeholder_warning_is_silent_for_clean_text() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_pretty_warning(&mut buf, true, "42% · 2h 05m");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn template_seed_note_is_quiet_without_a_note_and_names_the_path_with_one() {
+        let mut buf: Vec<u8> = Vec::new();
+        note_template_seed(&mut buf, None);
+        assert!(buf.is_empty());
+
+        let mut buf: Vec<u8> = Vec::new();
+        note_template_seed(&mut buf, Some(std::path::Path::new("/tmp/cfg.toml")));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.starts_with("created config template at "), "{out}");
+        assert!(out.contains("/tmp/cfg.toml"), "{out}");
+    }
+
+    #[test]
     fn a_failed_cycle_persist_is_not_announced_to_waybar() {
         // Signalling after a failed persist made Waybar re-render the *same*
         // vendor, so the scroll looked swallowed. An empty vendor set is the
@@ -1211,6 +1184,20 @@ mod tests {
         assert!(!dispatch_is_eligible(&cli, &config, Vendor::Kimi));
         // Normal implicit resolution avoids that disabled vendor entirely.
         assert_eq!(cli.resolve_vendor_with(&config, None), Vendor::Anthropic);
+    }
+
+    #[test]
+    fn disabled_vendor_error_suggests_enabling_the_section() {
+        let msg = disabled_vendor_error(Vendor::Kimi).to_string();
+        assert!(msg.contains("enabled = true"), "{msg}");
+        assert!(msg.contains("[kimi]"), "{msg}");
+    }
+
+    #[test]
+    fn disabled_vendor_error_uses_the_exact_opencode_go_section_name() {
+        let msg = disabled_vendor_error(Vendor::OpenCodeGo).to_string();
+        assert!(msg.contains("[opencode-go]"), "{msg}");
+        assert!(!msg.contains("[opencode go]"), "{msg}");
     }
 
     // --- issue #14: multi-account Anthropic target resolution ---------------
@@ -1308,8 +1295,9 @@ mod tests {
                 label: "work".into(),
                 api_key_env: None,
                 api_key: Some("work-key".into()),
-            
-            monthly_limit: None,});
+
+                monthly_limit: None,
+            });
         config
             .openrouter
             .accounts
@@ -1317,8 +1305,9 @@ mod tests {
                 label: "personal".into(),
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
-            
-            monthly_limit: None,});
+
+                monthly_limit: None,
+            });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
         let cli = cli_with(Some("work"), None, Some(root_str));
@@ -1383,5 +1372,134 @@ mod tests {
         cli.desktop = true;
         assert!(validate_vendor_options(&cli, Vendor::Openrouter).is_err());
         assert!(validate_vendor_options(&cli, Vendor::Anthropic).is_ok());
+    }
+
+    // --- --vendor all: bounded cold start ---------------------------------
+    // The deadline path is pinned here hermetically (injected deadline +
+    // injected fetches); a live `--vendor all` run proves nothing.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::tui::app::{ReadyTab, TabId, TabState};
+    use crate::usage::ZaiSnapshot;
+    use crate::vendor::VendorId;
+
+    fn zai_ready_state(pct: i32) -> TabState {
+        TabState::Ready(Box::new(ReadyTab {
+            snapshot: crate::usage::VendorSnapshot::Zai(ZaiSnapshot {
+                plan: "GLM Coding Pro".into(),
+                session: Some(UsageWindow {
+                    utilization_pct: pct,
+                    resets_at: None,
+                    window_duration: chrono::Duration::hours(5),
+                }),
+                weekly: None,
+                mcp: None,
+                usage_stats: None,
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: None,
+        }))
+    }
+
+    fn not_checked_row(short_name: &str) -> String {
+        format!("⚠ {short_name} not checked (cold start deadline)")
+    }
+
+    /// Given a 50ms budget, one immediate tab, one never-resolving tab, and
+    /// one tab that must never be started: the helper still returns within
+    /// the budget, the fast tab is collected, and the cut-off tabs render
+    /// the explicit not-checked row instead of stalling the bar.
+    #[tokio::test]
+    async fn aggregate_deadline_bounds_cold_start_and_skips_unstarted_tabs() {
+        let tabs = vec![
+            TabId::vendor(VendorId::Zai),
+            TabId::vendor(VendorId::Kimi),
+            TabId::vendor(VendorId::Kilo),
+        ];
+        let kilo_fetched = Arc::new(AtomicBool::new(false));
+        let kilo_fetched_flag = kilo_fetched.clone();
+        let fetch =
+            move |tab: TabId| -> std::pin::Pin<Box<dyn std::future::Future<Output = TabState>>> {
+                match tab.vendor {
+                    VendorId::Zai => Box::pin(async { zai_ready_state(42) }),
+                    // The hung-command probe: a vendor that never answers.
+                    VendorId::Kimi => Box::pin(std::future::pending()),
+                    _ => {
+                        kilo_fetched_flag.store(true, Ordering::SeqCst);
+                        Box::pin(async { TabState::Error("must not be live-fetched".into()) })
+                    }
+                }
+            };
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let entries = aggregate_entries_with_deadline(&tabs, deadline, fetch).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "helper overran the 50ms budget: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            entries[0].error.is_none(),
+            "fast tab not collected: {:?}",
+            entries[0].error
+        );
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some(not_checked_row("kmi").as_str())
+        );
+        assert_eq!(
+            entries[2].error.as_deref(),
+            Some(not_checked_row("klo").as_str())
+        );
+        assert!(
+            !kilo_fetched.load(Ordering::SeqCst),
+            "a tab past the deadline was live-fetched"
+        );
+    }
+
+    /// An already-spent deadline defers from the very first tab: no fetch
+    /// call is made at all.
+    #[tokio::test]
+    async fn aggregate_deadline_defers_the_first_tab_without_fetching_it() {
+        let tabs = vec![TabId::vendor(VendorId::Zai)];
+        let zai_fetched = Arc::new(AtomicBool::new(false));
+        let zai_fetched_flag = zai_fetched.clone();
+        let fetch =
+            move |tab: TabId| -> std::pin::Pin<Box<dyn std::future::Future<Output = TabState>>> {
+                zai_fetched_flag.store(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    let _ = tab;
+                    TabState::Error("must not be live-fetched".into())
+                })
+            };
+
+        let entries =
+            aggregate_entries_with_deadline(&tabs, std::time::Instant::now(), fetch).await;
+
+        assert!(!zai_fetched.load(Ordering::SeqCst));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some(not_checked_row("zai").as_str())
+        );
+    }
+
+    /// Malformed-input pin: an empty tab list yields no entries, no panic.
+    #[tokio::test]
+    async fn aggregate_deadline_with_no_tabs_returns_no_entries() {
+        let entries = aggregate_entries_with_deadline(
+            &[],
+            std::time::Instant::now(),
+            |tab: TabId| async move {
+                let _ = tab;
+                TabState::Loading
+            },
+        )
+        .await;
+        assert!(entries.is_empty());
     }
 }

@@ -43,6 +43,45 @@ pub fn usd(v: f64) -> String {
     money(v, "USD")
 }
 
+/// Fallback for a currency whose minor-unit exponent the code table cannot
+/// know: the raw amount rides with an explicit `minor units` marker instead
+/// of a silently wrong scale.
+pub fn fmt_minor_units(minor: i64, currency: &str) -> String {
+    let sign = if minor < 0 { "-" } else { "" };
+    format!("{sign}{} minor units {currency}", minor.unsigned_abs())
+}
+
+/// Format an amount in minor units with its own currency and scale. Rendering
+/// R$ 141.57 as "$141.57" is a claim about the wrong currency — the same class
+/// of defect as a fabricated number. Known codes get their symbol (mirroring
+/// `deepseek::format_money`); anything else renders as `AMOUNT CODE`, which is
+/// still truthful.
+pub fn fmt_minor(minor: i64, decimal_places: u32, currency: Option<&str>) -> String {
+    let scale = 10_u64.pow(decimal_places);
+    // `unsigned_abs`, not negation: `-i64::MIN` overflows. Unreachable from
+    // the wire (the parse gate rejects negatives) but this is a pub fn.
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.unsigned_abs();
+    let number = if decimal_places == 0 {
+        format!("{abs}")
+    } else {
+        format!(
+            "{}.{:0width$}",
+            abs / scale,
+            abs % scale,
+            width = decimal_places as usize
+        )
+    };
+    match currency {
+        None | Some("USD") => format!("{sign}${number}"),
+        Some("BRL") => format!("{sign}R${number}"),
+        Some("EUR") => format!("{sign}€{number}"),
+        Some("GBP") => format!("{sign}£{number}"),
+        Some("JPY") | Some("CNY") => format!("{sign}¥{number}"),
+        Some(other) => format!("{sign}{number} {other}"),
+    }
+}
+
 pub fn local_time_hm(when: DateTime<Utc>) -> String {
     when.with_timezone(&Local).format("%H:%M").to_string()
 }
@@ -92,6 +131,31 @@ pub fn substitute(template: &str, values: &HashMap<&str, String>) -> String {
         }
     }
     out
+}
+
+/// Placeholder-shaped tokens (`{[a-z_]+}`) that survived substitution —
+/// names the active vendor never provided. [`substitute`] leaves unknown keys
+/// in the output verbatim, so the pretty (TTY) surface scans for them and
+/// warns once instead of letting a typo'd `--format` put a literal
+/// `{sesson_pct}` on the bar. Deduplicated, in first-appearance order.
+pub fn unrecognized_placeholders(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        let key = &after_open[..close];
+        if !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            let token = format!("{{{key}}}");
+            if !found.contains(&token) {
+                found.push(token);
+            }
+        }
+        rest = &after_open[close + 1..];
+    }
+    found
 }
 
 /// Convenience: build a placeholder map from `(&str, impl Into<String>)` pairs.
@@ -191,5 +255,24 @@ mod tests {
     fn utf8_around_braces() {
         let v = pm(&[("x", "→")]);
         assert_eq!(substitute("α{x}β", &v), "α→β");
+    }
+
+    #[test]
+    fn unrecognized_placeholders_names_the_unknown_keys() {
+        let v = pm(&[("session_pct", "42")]);
+        let out = substitute("{sesson_pct} {session_pct}", &v);
+        assert_eq!(unrecognized_placeholders(&out), vec!["{sesson_pct}"]);
+    }
+
+    #[test]
+    fn unrecognized_placeholders_ignores_non_placeholder_shapes_and_dedups() {
+        // Only `{[a-z_]+}` counts: empty, uppercase, digit-bearing, and
+        // unmatched braces are not placeholder-shaped; a repeated unknown is
+        // reported once, in first-appearance order.
+        assert!(unrecognized_placeholders("42 {Session} {x1} {} {unclosed").is_empty());
+        assert_eq!(
+            unrecognized_placeholders("{a} {a} {b_b}"),
+            vec!["{a}", "{b_b}"]
+        );
     }
 }
