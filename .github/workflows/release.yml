@@ -13,6 +13,13 @@ on:
 permissions:
   contents: read
 
+# cancel-in-progress must stay false: killing publish-aur mid-push (or
+# crates.io mid-publish) because a re-tag raced is worse than the race. This
+# is the ci.yml pattern with cancellation deliberately disabled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Nothing verified that the artifacts about to be published carry the version
   # the tag claims. At v0.13.0 the packaging `.SRCINFO` files still said 0.8.0
@@ -56,29 +63,13 @@ jobs:
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main \
             || { echo "::error::tag '$ref' does not point to a commit on main"; exit 1; }
 
-          fail=0
-          check() { # check <what> <actual> <expected>
-            if [ "$2" != "$3" ]; then
-              echo "::error::$1 is '$2' but the tag says '$3'"; fail=1
-            fi
-          }
-          check "Cargo.toml version" \
-            "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" "$version"
-          check "Omarchy plugin version" \
-            "$(jq -r '.version' manifest.json)" "$version"
-          check "PKGBUILD pkgver" \
-            "$(grep -m1 '^pkgver=' packaging/aur/PKGBUILD | cut -d= -f2)" "$version"
-          check "PKGBUILD-bin pkgver" \
-            "$(grep -m1 '^pkgver=' packaging/aur/PKGBUILD-bin | cut -d= -f2)" "$version"
-          check ".SRCINFO pkgver" \
-            "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO | awk '{print $3}')" "$version"
-          check ".SRCINFO-bin pkgver" \
-            "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO-bin | awk '{print $3}')" "$version"
+          # The six-file agreement, the CHANGELOG section, and the
+          # no-published-section-moved diff all live in one script shared with
+          # the PR-time `version-drift` ci.yml job, so the two gates cannot
+          # drift apart. Everything above — tag format, existence, annotated
+          # type, main ancestry — is tag-time-only and stays here.
+          bash scripts/check-release-versions.sh "$version"
 
-          grep -q "^## \[$version\]" CHANGELOG.md \
-            || { echo "::error::CHANGELOG.md has no '## [$version]' section"; fail=1; }
-
-          [ "$fail" -eq 0 ] || exit 1
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "verified $ref"
 
@@ -122,12 +113,52 @@ jobs:
         with:
           tool: cross
 
-      - name: Test (native only — aarch64 binaries can't run on x86 runner)
+      # aarch64 execution is proven by the qemu smoke below, right after the
+      # cross build — this step stays native (x86_64) only.
+      - name: Test (x86_64 native)
         if: matrix.builder == 'cargo'
         run: cargo test --release --target ${{ matrix.target }} --locked
 
       - name: Build release binaries
         run: ${{ matrix.builder }} build --release --target ${{ matrix.target }} --locked
+
+      # The aarch64 build was historically never executed before upload: it is
+      # dynamically linked, so bare qemu-user would need a target sysroot.
+      # setup-qemu-action registers the arm64 binfmt handler instead, letting a
+      # plain arm64 ubuntu container run the real shipped artifact — the exact
+      # binary that the tarball step below packages from this directory. No
+      # continue-on-error anywhere: binfmt unavailable or a mismatch fails the
+      # release.
+      - name: Set up QEMU binfmt (run arm64 containers on the x86_64 runner)
+        if: matrix.builder == 'cross'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Smoke the aarch64 binary under qemu (version + usage JSON)
+        if: matrix.builder == 'cross'
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not extract version from Cargo.toml"
+            exit 1
+          fi
+          # `usage --json` legitimately exits 1 when every entry errors (this
+          # container has no credentials) — the assertion is that its stdout
+          # parses as JSON, i.e. the binary linked and ran at all.
+          docker run --platform linux/arm64 --rm \
+            -v "$PWD/target/${{ matrix.target }}/release:/a:ro" \
+            -e "EXPECTED_VERSION=$version" \
+            ubuntu:24.04 /bin/bash -ceu '
+              out="$(/a/ai-usagebar-omarchy --version)"
+              echo "$out"
+              case "$out" in
+                *"$EXPECTED_VERSION"*) ;;
+                *) echo "version mismatch: got \"$out\", want substring $EXPECTED_VERSION"; exit 1 ;;
+              esac
+              json="$(/a/ai-usagebar-omarchy usage --json || true)"
+              printf "%s" "$json" | python3 -c "import json,sys; json.load(sys.stdin)"
+              echo "aarch64 smoke ok"
+            '
 
       - name: Create tarball (both bins + LICENSE + config example)
         run: |

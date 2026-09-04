@@ -278,9 +278,7 @@ pub fn acquire_lock(path: &Path, timeout: Duration) -> Result<LockGuard> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let f = options
-        .open(path)
-        .map_err(|e| AppError::io_at(path, e))?;
+    let f = options.open(path).map_err(|e| AppError::io_at(path, e))?;
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -420,7 +418,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_payload_respects_ttl() {        let (_td, cache) = fixture();
+    fn fresh_payload_respects_ttl() {
+        let (_td, cache) = fixture();
         cache.write_payload(b"x").unwrap();
         // Fresh = within a generous TTL.
         assert!(
@@ -539,7 +538,10 @@ mod tests {
         let persisted = fs::read_to_string(cache.last_error_path()).unwrap();
         assert!(persisted.contains("400\n"), "{persisted}");
         assert!(!persisted.contains("sk-ant-api03"), "{persisted}");
-        assert!(persisted.contains("malformed Authorization: [redacted]"), "{persisted}");
+        assert!(
+            persisted.contains("malformed Authorization: [redacted]"),
+            "{persisted}"
+        );
         assert!(persisted.ends_with("retry"), "{persisted}");
         // The returned pair (what tooltips show) matches what was persisted.
         assert_eq!(shown, persisted.split_once('\n').unwrap().1);
@@ -559,7 +561,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(stale_mode & 0o777, 0o600, "stale marker mode {stale_mode:o}");
+        assert_eq!(
+            stale_mode & 0o777,
+            0o600,
+            "stale marker mode {stale_mode:o}"
+        );
 
         let lock = cache.dir.join(".fetch.lock");
         let _guard = acquire_lock(&lock, Duration::from_millis(100)).unwrap();

@@ -79,7 +79,9 @@ pub fn run(action: &AccountAction) -> i32 {
 /// status can safely fall back to the conventional account locations.
 fn config_or_default() -> Config {
     Config::load().unwrap_or_else(|error| {
-        eprintln!("ai-usagebar-omarchy account: using defaults, config.toml did not parse: {error}");
+        eprintln!(
+            "ai-usagebar-omarchy account: using defaults, config.toml did not parse: {error}"
+        );
         Config::default()
     })
 }
@@ -205,9 +207,9 @@ fn status(json: bool) -> i32 {
         "accounts": cli_rows,
     });
 
-    // The menu bar consumes this exact TUI enumeration instead of duplicating
+    // The menu bar consumes this exact tab enumeration instead of duplicating
     // profile paths and CLI/Desktop dedup policy in Swift.
-    let usage_accounts: Vec<serde_json::Value> = crate::tui::app::tabs_with_desktop(&config)
+    let usage_accounts: Vec<serde_json::Value> = crate::tabs::tabs_with_desktop(&config)
         .into_iter()
         .filter(|tab| tab.vendor == crate::vendor::VendorId::Anthropic)
         .filter_map(|tab| {

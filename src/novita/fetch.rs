@@ -4,16 +4,15 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch::{HTTP_TIMEOUT_DEFAULT_SECS, LOCK_TIMEOUT_SECS, run_cached_fetch};
 use crate::usage::{NovitaSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
 use super::types::{BalanceData, to_snapshot};
 
 pub const BASE_URL: &str = "https://api.novita.ai";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -28,14 +27,13 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: NovitaSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<NovitaSnapshot>;
 
+/// On failure we show the last good figure with the error alongside it. With
+/// nothing usable cached there is nothing to show, so the **original** error is
+/// returned rather than a generic "no usable cache" that hides what went wrong
+/// — exactly the fallback policy the shared `run_cached_fetch` implements, so
+/// this wrapper returns its result unmapped.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     api_key: &str,
@@ -43,74 +41,19 @@ pub async fn fetch_snapshot(
     endpoints: &Endpoints,
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false)
-    {
-        return Ok(outcome);
-    }
-
-    match fetch_live(client, endpoints, api_key).await {
-        Ok(balance) => {
-            let snap = to_snapshot(balance)?;
-            let bytes = serde_json::to_vec(&serde_json::json!({ "snapshot": serde_repr(&snap) }))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some(diag), AppError::Http { status, body })
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), e)
-        }
-    }
-}
-
-fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
+    let live = async {
+        let balance = fetch_live(client, endpoints, api_key).await?;
+        to_snapshot(balance)
     };
-    reuse_cache(&bytes, cache, true)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool) -> Result<FetchOutcome> {
-    let snap = parse_cache(bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    run_cached_fetch(
+        cache,
+        Duration::from_secs(LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        live,
+        |text| parse_cache(text).ok(),
+        snapshot_json,
+    )
+    .await
 }
 
 fn serde_repr(snap: &NovitaSnapshot) -> serde_json::Value {
@@ -122,8 +65,14 @@ fn serde_repr(snap: &NovitaSnapshot) -> serde_json::Value {
     })
 }
 
-fn parse_cache(bytes: &[u8]) -> Result<NovitaSnapshot> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)?;
+/// The shared pipeline stores `to_json` output verbatim; `Value::to_string`
+/// is the same compact encoding `serde_json::to_vec` produced before.
+fn snapshot_json(snap: &NovitaSnapshot) -> String {
+    serde_json::json!({ "snapshot": serde_repr(snap) }).to_string()
+}
+
+fn parse_cache(text: &str) -> Result<NovitaSnapshot> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
     let s = v
         .get("snapshot")
         .ok_or_else(|| AppError::Schema("novita cache missing 'snapshot' field".into()))?;
@@ -149,7 +98,7 @@ async fn fetch_live(
     api_key: &str,
 ) -> Result<BalanceData> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(&endpoints.balance)
             .header("Authorization", format!("Bearer {api_key}"))

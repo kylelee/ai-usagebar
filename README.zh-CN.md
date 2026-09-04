@@ -14,14 +14,16 @@ ai-usagebar-omarchy 最初是
 ## 功能特性
 
 - **Z.AI / BigModel 企业（团队）订阅密钥**：同一监控端点加 `?type=2` 与组织/项目请求头——按密钥配置计费类型即可，站点（z.ai / bigmodel.cn）自动检测。按量付费密钥自动降级为 7 天用量统计。
-- **Z.AI 与 Kimi 多账号**（`[[zai.accounts]]` / `[[kimi.accounts]]`）：每把密钥在任务栏有独立磁贴、在 TUI 有独立标签页、独立缓存——通过原生设置表单（添加/重命名/删除、逐卡 Apply）或在 `config.toml` 中管理。
+- **所有密钥类供应商均支持多账号**（`[[zai.accounts]]`、`[[kimi.accounts]]`、`[[openrouter.accounts]]`、`[[deepseek.accounts]]`……）：每把密钥在任务栏有独立磁贴、在 TUI 有独立标签页、独立缓存——通过原生设置表单（按供应商分组、添加/删除、逐卡 Apply）或在 `config.toml` 中管理。账号按其在列表中的位置自动命名（1、2……）：无需配置名字，`--account 2` 即选择第二个。
+- **OpenAI 平台消费**（`[openai_api]`）：通过组织管理员密钥从 Costs API 读取近 30 天账单金额——OpenAI 版的 Anthropic API 供应商，每个账号可选设月度上限。这些端点会拒绝普通项目 `sk-` 密钥。
 - **任务栏逐窗口分级配色**：5 小时与周窗口各自是独立的 Text 对象，按各自剩余量着色——绿色 ≥50%、黄色 <50%、橙色 <20%、红色 <5%——因此同一磁贴里绿色 5 小时图可以与橙色周图并存；账号标签恒为主题前景色，不随用量变化。各窗口带自己的重置倒计时（`42%·2h 05m 15%·2d 3h`；未启动的窗口显示 `0%·-`）。
 - 每供应商 Waybar 模块使用与 claudebar 相同的 JSON 结构和参数。
 - Omarchy Quattro 原生插件跟随 shell 主题，支持键盘导航、供应商切换、实时重置计时器与过期/错误状态。
 - `ai-usagebar-omarchy-tui` 启动即显示紧凑的供应商总览，每 60 秒刷新。导航支持侧栏、顶栏或隐藏供应商框。
 - 可选的 Claude Code 上下文视图读取近期本地会话用量，不扫描完整历史。
 - Omarchy Quattro 原生插件是主前端。
-- 一个任务栏项同时平铺所有已启用账号（Waybar 用 `--vendor all`；Omarchy 任务栏原生如此）。`[ui] primary` 控制小组件与 TUI 的初始供应商。
+- 一个任务栏项同时平铺所有已启用账号（Waybar 用 `--vendor all`；Omarchy 任务栏原生如此）。`[ui] primary` 控制小组件与 TUI 的初始供应商。耗尽的账号（所有窗口全部打满，或余额为零）会离开任务栏，直到下一次报告显示又有余量——标签页与悬停弹窗仍保留它们。
+- 任务栏磁贴带各供应商 logo 与紧凑单位倒计时（`5.3h`、`2.3d`）；悬浮提示与面板保留详细的 `2h 05m` 形式。
 - 原子缓存与文件锁避免多显示器 Waybar 配置的重复请求。
 - 网络故障时保留上一次数据可见；HTTP 错误显示在悬浮提示中。
 - `--pretty`、`--watch N` 与 `make smoke` 便于本地测试与 API 响应变化排查。
@@ -45,10 +47,20 @@ cargo install --git https://github.com/KyleLee/ai-usagebar-omarchy
 omarchy plugin add https://github.com/KyleLee/ai-usagebar-omarchy.git --enable
 ```
 
+步骤 1 从源码编译。在 Arch 系发行版上，AUR 助手无需本地克隆即可安装同样的内容：
+
+```bash
+yay -S ai-usagebar-omarchy           # 或任意 AUR 助手（paru 等）；从源码构建
+yay -S ai-usagebar-omarchy-bin       # GitHub Releases 的预编译二进制
+```
+
+只要有 Rust，任何地方都可以用 `cargo binstall ai-usagebar` 直接拉取同样的发布
+二进制而无需编译（助手本身用 `cargo install cargo-binstall` 安装一次即可）。
+
 还没有 Rust？先从 <https://rustup.rs> 安装——`cargo install` 会把
 `ai-usagebar-omarchy` 和 `ai-usagebar-omarchy-tui` 都装进 `~/.cargo/bin`
 （确保该目录在会话 PATH 内，Omarchy shell 才能找到二进制）。之后重跑同一命令加
-`--force` 即可更新。
+`--force` 即可更新。AUR 包和 `cargo binstall` 同样会把两个二进制放进 PATH。
 
 可选：隐藏系统自带 Agents 小组件避免重复：
 
@@ -58,7 +70,8 @@ omarchy plugin disable omarchy.agents
 
 完成——任务栏立即平铺所有已配置账号（右键启动 TUI；cargo 已一并安装）。什么都没配置？
 点任务栏图标 → 齿轮（`s`）→ **ACCOUNTS** → **Add account** → 选供应商
-（Z.AI / Kimi）→ 粘贴 API 密钥（名字已预填，可修改）→ **Apply**。Z.AI 团队密钥
+（Z.AI / Kimi）→ 粘贴 API 密钥 → **Apply**——账号只需要这些。账号按其在该供应商
+列表中的位置自动命名（1、2……），`--account 2` 即选择第二个。Z.AI 团队密钥
 再选 `team` 计费类型并粘贴两个组织 ID；站点（z.ai / bigmodel.cn）按类型自动检测。
 
 左键打开原生 Quattro 面板；中键/滚轮切换供应商。首次运行还会在该路径生成全注释
@@ -148,6 +161,9 @@ Moonshot、Grok、SuperGrok、Antigravity、Cursor、MiniMax 与 Kiro CLI 默认
 - Cursor 的 `state.vscdb` 与 `cursor-agent` 回退 `auth.json` 只读。
 - kiro-cli 的 `data.sqlite3` 只读。刷新后的凭据写入账号级 `kiro/oauth.json`
   （Unix 权限 `600`）。
+- 跨越净化边界的不可信文本会自动脱敏 token 形态的子串（`sk-…` 密钥、`Bearer …`
+  值、32 位以上不透明 base64/hex 串），封堵错误信息把提交过的密钥回显进悬浮
+  提示的残余风险；普通诊断信息（带连字符的模型 id、带句点的 JWT）保持可读。
 
 #### macOS：钥匙串中的 Claude 凭据
 
@@ -185,6 +201,26 @@ enabled = true
 ```
 
 完整字段见[配置参考](docs/configuration.md)。
+
+### 设置桥接
+
+原生前端不自己解析 `config.toml`，而是经过两个管理子命令：
+
+```bash
+# 输出当前设置的非敏感 JSON 描述：主供应商，以及每个供应商提供哪些密钥字段。绝不打印密钥。
+ai-usagebar-omarchy settings show
+
+# 从标准输入读取并应用一个 JSON 补丁——密钥不会出现在 argv 或进程环境里。
+echo '{"schema_version":1,"keys":{"kimi":{"action":"set","value":"..."}}}' \
+    | ai-usagebar-omarchy settings apply
+```
+
+补丁携带可选的 `primary` 供应商 slug 和一个 `keys` 映射；每个密钥条目形如
+`{"action":"set","value":…}`、`{"action":"clear"}` 或
+`{"action":"fields","fields":{…}}`（供应商专属值：Z.AI 团队 ID、月度上限等）。
+保存非空密钥同样会把该供应商的 `enabled` 置为 `true`，与 TUI 悬浮层一致。
+这就是 Omarchy 设置表单所讲的协议；它经由同一条 `toml_edit` 路径编辑上文
+同一份 `config.toml`。
 
 ## 快速上手
 
@@ -447,8 +483,9 @@ ai-usagebar-omarchy --watch 5                              # 实时迭代 --form
 ai-usagebar-omarchy --vendor openrouter --format '{or_balance} · today {or_used_today}'
 
 make test                                          # 单元 + 集成测试
-source ~/.config/zsh/secrets                       # 现有供应商联调测试必需
-make smoke                                         # 运行全部 ignored 测试；无密钥的 Kimi 跳过
+source ~/.config/zsh/secrets                       # 可选：为联调测试加载真实密钥
+make smoke                                         # 21 个真实 API 冒烟测试——缺少凭据的供应商会自行跳过，
+                                                   # 用手头有的密钥跑即可；错误密钥会被真实端点立即拒绝
 make clippy                                        # cargo clippy -D warnings
 ```
 
@@ -548,6 +585,10 @@ Omarchy 原生 QML 表单使用相同的 Rust 持久化路径与语义。绝不�
   （`~/.config/omarchy/current/theme/colors.toml`）。
 - 单色覆盖：`--color-low`、`--color-mid`、`--color-high`、`--color-critical`
   （兼容 claudebar）。
+- 配速档位（兼容 claudebar）：`--pace-tolerance <pp>` 放宽或收紧基于比率的配速
+  图标判定带宽（百分点，默认 5）；`--format-pace-color` 让每个配速占位符按各自
+  窗口着色而非全局用量色；`--tooltip-pace-pts` 把悬浮提示的配速列切换为按点
+  配速，并在进度条上加入已流逝位置标记。
 
 ## 更新日志
 

@@ -16,6 +16,32 @@ permissions:
   contents: read
 
 jobs:
+  # Release-version drift used to be caught only by the tag-time
+  # verify-version job — after the tag is immutable (v0.17.0 never shipped
+  # because .SRCINFO lagged a release). This runs the exact same script as a
+  # PR gate so a mismatch is caught while the fix is still an ordinary commit.
+  version-drift:
+    name: release versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            release-versions:
+              - 'Cargo.toml'
+              - 'manifest.json'
+              - 'packaging/**'
+              - 'CHANGELOG.md'
+              - 'scripts/check-release-versions.sh'
+              - '.github/workflows/ci.yml'
+
+      - name: Check release-version consistency
+        if: steps.filter.outputs.release-versions == 'true'
+        run: bash scripts/check-release-versions.sh
+
   # The platform the widget actually ships on. Until this existed, Linux was
   # only exercised *after* a tag was pushed — by which point the tag is
   # immutable and a failure costs a new patch release.
@@ -24,6 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # qmllint ships in qt6-declarative-dev-tools; Makefile's qml-lint
+      # discovery finds it under /usr/lib/qt6/bin.
+      - name: Install Qt 6 QML tooling
+        run: sudo apt-get update && sudo apt-get install -y qt6-declarative-dev-tools
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -40,6 +71,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
+      - name: Test doctests
+        run: cargo test --doc --locked
+
       - name: Test desktop integration models
         run: make desktop-test
 
@@ -48,6 +82,11 @@ jobs:
       # like desktop-test.
       - name: Test Omarchy plugin model
         run: make plugin-test
+
+      # Linux-only because it needs Qt; the Makefile keeps the standing
+      # false-positive documented (Plasmoid.contextualActions list type).
+      - name: QML lint
+        run: make qml-lint
 
       - name: Unused dependencies
         uses: bnjbvr/cargo-machete@ac30a525c0a8d163a92d727b3ff079ee3f6ecb08 # v0.9.2
@@ -153,8 +192,8 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
-      - name: Test GNOME marker logic
-        run: node gnome-extension/marker-logic.test.mjs
+      - name: Test GNOME report model
+        run: node gnome-extension/report-model.test.mjs
 
       - name: Test KDE plasmoid logic
         run: node kde-plasmoid/plasmoid-logic.test.mjs

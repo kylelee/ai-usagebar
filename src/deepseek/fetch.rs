@@ -2,15 +2,14 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch::{HTTP_TIMEOUT_DEFAULT_SECS, LOCK_TIMEOUT_SECS, run_cached_fetch};
 use crate::usage::DeepseekSnapshot;
 
 use super::types::BalanceResponse;
 
 pub const BASE_URL: &str = "https://api.deepseek.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -25,13 +24,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: DeepseekSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = crate::fetch::FetchOutcome<DeepseekSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -40,74 +33,39 @@ pub async fn fetch_snapshot(
     endpoints: &Endpoints,
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
+    run_cached_fetch(
+        cache,
+        Duration::from_secs(LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        fetch_live(client, &endpoints.balance, api_key),
+        |text| parse_cache(text).ok(),
+        snapshot_json,
+    )
+    .await
+    .map_err(no_cache_error)
+}
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(bytes, cache, false)
-    {
-        return Ok(outcome);
+/// DeepSeek's half of the fallback policy. The shared pipeline returns live
+/// errors UNMAPPED (crate::fetch contract); this wrapper re-applies the
+/// synthetic texts the pre-migration code produced when nothing usable was
+/// cached: a transient failure means the network is down, everything else
+/// means the account state could not be read. Cache-infrastructure failures
+/// (dir create, flock, payload IO) are not live errors and keep their own
+/// diagnostics.
+fn no_cache_error(e: AppError) -> AppError {
+    match e {
+        AppError::Io { .. } | AppError::IoBare(_) | AppError::Other(_) => e,
+        AppError::Transport(_) => {
+            AppError::Transport("deepseek: no cache and network unreachable".into())
+        }
+        _ => AppError::Other("deepseek: no usable cache".into()),
     }
-    // Corrupt fresh cache: fall through to live fetch rather than return a
-    // fabricated zero balance.
-
-    match fetch_live(client, &endpoints.balance, api_key).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let last_error = Some(cache.write_last_error(status, &body));
-            fallback_with_error(cache, last_error)
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let last_error = Some(cache.write_last_error(0, &e.to_string()));
-            fallback_with_error(cache, last_error)
-        }
-    }
-}
-
-fn fallback_silent(cache: &Cache) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Transport(
-            "deepseek: no cache and network unreachable".into(),
-        ));
-    };
-    reuse_cache(bytes, cache, true)
-}
-
-fn fallback_with_error(cache: &Cache, last_error: Option<(u16, String)>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Other("deepseek: no usable cache".into()));
-    };
-    let mut outcome = reuse_cache(bytes, cache, true)?;
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
-    let snap = parse_cache(&bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
 }
 
 /// Cached money is required, not optional: a truncated or half-written payload
 /// must be refetched rather than rendered as a $0.00 balance.
-fn parse_cache(bytes: &[u8]) -> Result<DeepseekSnapshot> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)?;
+fn parse_cache(text: &str) -> Result<DeepseekSnapshot> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
     let money = |name: &str| -> Result<f64> {
         let n = v[name]
             .as_f64()
@@ -149,13 +107,19 @@ fn snap_to_json(snap: &DeepseekSnapshot) -> serde_json::Value {
     })
 }
 
+/// The shared pipeline stores `to_json` output verbatim; `Value::to_string`
+/// is the same compact encoding `serde_json::to_vec` produced before.
+fn snapshot_json(snap: &DeepseekSnapshot) -> String {
+    snap_to_json(snap).to_string()
+}
+
 async fn fetch_live(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
 ) -> Result<DeepseekSnapshot> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(url)
             .header("Authorization", format!("Bearer {api_key}"))
@@ -202,7 +166,7 @@ mod tests {
             "topped_up": 0.0,
             "currency": "EUR"
         });
-        let error = parse_cache(cache.to_string().as_bytes()).unwrap_err();
+        let error = parse_cache(&cache.to_string()).unwrap_err();
         assert!(
             error.to_string().contains("unsupported currency"),
             "{error}"

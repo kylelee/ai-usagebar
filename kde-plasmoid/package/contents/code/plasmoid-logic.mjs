@@ -16,7 +16,13 @@
 //   - no Unicode property escapes (\p{...}), which V4 evaluates to false
 //     *silently* rather than throwing.
 
-export const DEFAULT_BINARY = 'ai-usagebar';
+export const DEFAULT_BINARY = 'ai-usagebar-omarchy';
+// The pre-rename name. The AUR packages ship it as a compatibility symlink;
+// a cargo-install only has the canonical name, and neither can be assumed
+// when binaryPath is empty ("search PATH").
+export const LEGACY_BINARY = 'ai-usagebar';
+export const DEFAULT_TUI_BINARY = 'ai-usagebar-omarchy-tui';
+export const LEGACY_TUI_BINARY = 'ai-usagebar-tui';
 export const DEFAULT_TIMEOUT_SECS = 600;
 export const MIN_TIMEOUT_SECS = 60;
 export const MAX_TIMEOUT_SECS = 3600;
@@ -90,25 +96,45 @@ export function buildArgv(binary, timeoutSecs) {
         .concat(call);
 }
 
+// An explicit binaryPath keeps the plain quoted-argv form (no shell). An
+// EMPTY one means "search PATH" — and which name is on it depends on the
+// install: this repo's packages install ai-usagebar-omarchy, a
+// cargo-install has only that name, and the AUR package adds an
+// ai-usagebar symlink for the pre-rename name. Resolve with command -v and
+// run exactly ONE of them (exec, so its exit code — including timeout(1)'s
+// 124 — propagates); a plain `||` fallback would re-run the legacy name
+// after a timeout on the canonical one and double the wait.
 export function buildCommand(binary, timeoutSecs) {
-    return buildArgv(binary, timeoutSecs).map(shellQuote).join(' ');
+    const explicit = String(binary ?? '').trim();
+    if (explicit)
+        return buildArgv(explicit, timeoutSecs).map(shellQuote).join(' ');
+    const secs = String(timeoutSeconds(timeoutSecs));
+    const q = shellQuote(DEFAULT_BINARY);
+    const legacy = shellQuote(LEGACY_BINARY);
+    const wrapped = `timeout -k ${TIMEOUT_KILL_GRACE_SECS} ${secs}`;
+    return `if command -v ${q} >/dev/null 2>&1; `
+        + `then exec ${wrapped} ${q} usage --json; `
+        + `else exec ${wrapped} ${legacy} usage --json; fi`;
 }
 
 // Launching the TUI needs a terminal, and there is no portable way to probe
 // PATH from QML. Emit a shell fallback chain instead and let KProcess take its
 // /bin/sh -c path — here the metacharacters are the point, unlike buildCommand
-// where they had to be quoted away. Mirrors the candidate list the GNOME
-// extension already walks.
-export function buildTuiCommand(terminalCommand, tui = 'ai-usagebar-tui') {
+// where they had to be quoted away. The TUI binary candidates mirror the
+// report command's name pair: canonical first, the AUR symlink second.
+export function buildTuiCommand(terminalCommand, tuis) {
+    const candidates = Array.isArray(tuis) && tuis.length
+        ? tuis
+        : [DEFAULT_TUI_BINARY, LEGACY_TUI_BINARY];
     const custom = String(terminalCommand ?? '').trim();
     if (custom)
-        return `${custom} ${shellQuote(tui)}`;
-    const q = shellQuote(tui);
-    return [
-        `konsole -e ${q}`,
-        `gnome-terminal -- ${q}`,
-        `xterm -e ${q}`,
-    ].join(' || ');
+        return `${custom} ${shellQuote(candidates[0])}`;
+    const chain = [];
+    for (const tui of candidates) {
+        const q = shellQuote(tui);
+        chain.push(`konsole -e ${q}`, `gnome-terminal -- ${q}`, `xterm -e ${q}`);
+    }
+    return chain.join(' || ');
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +185,26 @@ export function severityColor(severity, colors) {
     }
 }
 
+// The tone a metric's VALUE text paints with — mirrors omarchy/Panel.qml's
+// MetricRow.tone rule so the two native popups colour the same row the same
+// way: session/weekly windows use the remaining-percentage bands (the same
+// bands the compact tiles use), every other metric escalates only on
+// critical. '' means plain text colour.
+export function metricTone(row) {
+    if (!row || row.type !== 'metric')
+        return '';
+    if (row.window === 'session' || row.window === 'weekly') {
+        if (row.percent === null || row.percent === undefined)
+            return '';
+        const remaining = 100 - row.percent;
+        if (remaining < 5) return 'critical';
+        if (remaining < 20) return 'high';
+        if (remaining < 50) return 'mid';
+        return 'low';
+    }
+    return row.severity === 'critical' ? 'critical' : '';
+}
+
 function normalizeSection(raw) {
     const type = String(raw && raw.type || '');
     if (type === 'spacer')
@@ -173,6 +219,10 @@ function normalizeSection(raw) {
             detail: safeText(raw.detail, 400),
             resetAt: safeText(raw.reset_at, 64),
             severity: severityOf(percent, raw.severity),
+            // Server-classified window ("session" | "weekly"); '' when the
+            // section is not a rolling window (or an older binary). metricTone
+            // and the compact cells key off it.
+            window: safeText(raw.window, 16),
         };
     }
     if (type === 'block') {
@@ -209,8 +259,26 @@ function normalizeEntry(raw) {
         status: safeText(raw.status, 24) || 'ready',
         stale: raw.stale === true,
         error: safeText(raw.error, 500),
+        // Precomputed by the Rust core (report.rs `headline_pick`): the figure
+        // a tile leads with. null for older binaries — headline() then walks
+        // the sections locally, under the same rule.
+        headline: normalizeHeadline(raw.headline),
         fetchedAt: safeText(raw.fetched_at, 64),
         sections: sections,
+    };
+}
+
+function normalizeHeadline(raw) {
+    if (!raw || typeof raw !== 'object')
+        return null;
+    const text = safeText(raw.text, 40);
+    if (text === '')
+        return null;
+    return {
+        text: text,
+        percent: finitePercent(raw.percent),
+        severity: severityOf(raw.percent, raw.severity),
+        label: safeText(raw.label, 120),
     };
 }
 
@@ -304,6 +372,17 @@ function toRing(ring) {
 export function headline(entry) {
     if (!entry)
         return {text: '', percent: null, severity: 'low', label: ''};
+    // The Rust core precomputes the pick (report.rs `headline_pick`); trust
+    // it when present. Older binaries fall through to the local walk below,
+    // which implements the same rule.
+    const pre = entry.headline;
+    if (pre)
+        return {
+            text: pre.text,
+            percent: pre.percent,
+            severity: pre.severity,
+            label: pre.label,
+        };
     let best = null;
     for (const s of entry.sections)
         if (s.type === 'metric' && s.percent !== null && (!best || s.percent > best.percent))

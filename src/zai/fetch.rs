@@ -12,6 +12,15 @@
 //!   endpoint answers "not subscribed" for it; the 7-day aggregate from the
 //!   model-usage endpoint is all there is to show.
 
+// Shared-pipeline exception (todo 13 STOP criterion): the Ok path caches the
+// RAW validated gateway envelope so every replay re-projects through the
+// CURRENT fetch plan (`Envelope::into_snapshot_for` — plan-aware and
+// self-healing across account-type edits by design, see types.rs); the shared
+// `fetch::run_cached_fetch` write step (`to_json(&snapshot)`) cannot
+// reproduce those bytes without a new raw-payload hook, so this module keeps
+// its local lock/cache/fallback shell. Only the degrade chain above was ever
+// going to stay vendor-side; the payload format is the other half.
+
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -192,12 +201,7 @@ pub async fn fetch_snapshot_plan(
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
             let last_error = Some(cache.write_last_error(status, &body));
-            fallback_with_error(
-                cache,
-                last_error,
-                plan,
-                AppError::Http { status, body },
-            )
+            fallback_with_error(cache, last_error, plan, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
@@ -629,7 +633,10 @@ mod tests {
     #[tokio::test]
     async fn no_plan_on_both_endpoints_appends_the_team_remedy() {
         let mut server = mockito::Server::new_async().await;
-        for path in ["/api/monitor/usage/quota/limit", "/api/monitor/usage/model-usage"] {
+        for path in [
+            "/api/monitor/usage/quota/limit",
+            "/api/monitor/usage/model-usage",
+        ] {
             server
                 .mock("GET", path)
                 .match_query(mockito::Matcher::Any)
@@ -682,7 +689,10 @@ mod tests {
         .await
         .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("403") || message.contains("forbidden"), "{message}");
+        assert!(
+            message.contains("403") || message.contains("forbidden"),
+            "{message}"
+        );
         assert!(!message.contains("no usable cache"), "{message}");
     }
 

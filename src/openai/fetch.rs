@@ -1,3 +1,11 @@
+//! Deliberately NOT on `crate::fetch::run_cached_fetch` (todo 14 documented
+//! exception, per the todo-13 STOP criterion): the cache payload is the RAW
+//! upstream body rather than a snapshot projection (a `to_json(&snapshot)`
+//! closure cannot reproduce those bytes), and the refresh-failure arms skip
+//! the stale marker and surface their own Credentials/Transport texts instead
+//! of the scaffold's unmapped originals — the todo-7 scaffold has no hook for
+//! either, so migrating would change on-disk bytes and error texts.
+//!
 //! Orchestrate: read ~/.codex/auth.json → maybe refresh → fetch usage → cache.
 //!
 //! Mirrors `anthropic::fetch::fetch_snapshot` but for the Codex OAuth flow.

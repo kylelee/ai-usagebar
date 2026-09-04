@@ -5,16 +5,15 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
+use crate::fetch;
 use crate::usage::{GrokSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
 use super::types::{BalanceResp, Validation, to_snapshot};
 
 pub const BASE_URL: &str = "https://management-api.x.ai";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -38,13 +37,7 @@ impl Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: GrokSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+pub type FetchOutcome = fetch::FetchOutcome<GrokSnapshot>;
 
 /// `management_key` is the xAI Management API key (distinct from the inference
 /// key). `team_id`, when set, skips the validation round-trip.
@@ -56,56 +49,29 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
     team_id: Option<&str>,
 ) -> Result<FetchOutcome> {
-    cache.ensure_dir()?;
-    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
-
     // Identity is derived from the *inputs*, not the resolved team, so a fresh
     // cache still costs zero network calls.
     let target = target_key(management_key, team_id);
-
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(&bytes, cache, false, &target)
-    {
-        return Ok(outcome);
-    }
-
-    let team = match resolve_team(client, endpoints, management_key, team_id).await {
-        Ok(t) => t,
-        Err(e) if e.is_transient() => return fallback_silent(cache, &target, e),
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            return fallback_with_error(cache, Some(diag), &target, e);
-        }
-    };
-
-    match fetch_live(client, endpoints, management_key, &team).await {
-        Ok(snap) => {
-            let bytes = serde_json::to_vec(&serde_json::json!({
+    fetch::run_cached_fetch(
+        cache,
+        Duration::from_secs(fetch::LOCK_TIMEOUT_SECS),
+        cache_ttl,
+        async {
+            // Team resolution is part of the live fetch: a fresh cache hit
+            // never reaches the validation round-trip.
+            let team = resolve_team(client, endpoints, management_key, team_id).await?;
+            fetch_live(client, endpoints, management_key, &team).await
+        },
+        |payload| parse_cache(payload.as_bytes(), &target).ok(),
+        |snap| {
+            serde_json::to_string(&serde_json::json!({
                 "target": target,
-                "team": team,
                 "snapshot": { "balance": snap.balance },
-            }))?;
-            cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
-        }
-        Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
-        Err(AppError::Http { status, body }) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
-        }
-        Err(e) => {
-            cache.mark_stale();
-            let diag = cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some(diag), &target, e)
-        }
-    }
+            }))
+            .unwrap_or_default()
+        },
+    )
+    .await
 }
 
 /// Identity of the inputs that determine *whose* balance gets fetched. With an
@@ -140,44 +106,6 @@ async fn resolve_team(
             v.resolved_team()
         }
     }
-}
-
-fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
-}
-
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned — a first run against an organization-scoped key must reach the
-/// user with its guidance intact, not as a generic "no usable cache".
-fn fallback_with_error(
-    cache: &Cache,
-    last_error: Option<(u16, String)>,
-    target: &str,
-    original: AppError,
-) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // A cache we cannot attribute to this target is no better than no cache.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
-}
-
-fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
-    let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
 }
 
 fn parse_cache(bytes: &[u8], target: &str) -> Result<GrokSnapshot> {
@@ -222,7 +150,7 @@ async fn get_json<T: for<'de> serde::Deserialize<'de>>(
     key: &str,
 ) -> Result<T> {
     let resp = tokio::time::timeout(
-        HTTP_TIMEOUT,
+        Duration::from_secs(fetch::HTTP_TIMEOUT_DEFAULT_SECS),
         client
             .get(url)
             .header("Authorization", format!("Bearer {key}"))

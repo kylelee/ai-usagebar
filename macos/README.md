@@ -15,7 +15,8 @@ A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
 
 ## Vendor scope
 
-The selector supports **thirteen vendors** that ship in the binary:
+The selector supports **13 of the binary's 18 vendors** (openai_api, supergrok,
+minimax, kiro CLI, and opencode Go are widget/TUI/Omarchy-only):
 
 - **Rate-limit windows (5h / weekly):** Claude, Codex,
   Z.AI (GLM), and Google Antigravity (two independent pools — Gemini, and

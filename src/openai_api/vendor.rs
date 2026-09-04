@@ -6,15 +6,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, usd};
+use crate::format::{placeholders, usd};
 use crate::pacing::PaceSeverity;
-use crate::pango::{color_span, escape, severity_color, severity_for};
+use crate::pango::{escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::OpenAiApiSnapshot;
-use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
-use crate::waybar::{Class, WaybarOutput};
-
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome, render_shell};
+use crate::waybar::WaybarOutput;
 
 impl From<super::fetch::FetchOutcome> for VendorOutcome {
     fn from(o: super::fetch::FetchOutcome) -> Self {
@@ -82,36 +81,15 @@ pub fn render(
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> WaybarOutput {
-    let class = Class::from(severity(snap));
-    let format = opts
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders(snap);
-
-    let mut text = substitute(&format, &values);
-    if outcome.stale {
-        text.push_str(" ⏸");
-    }
-
-    let wrapper_color = severity_color(severity(snap), theme).to_string();
-    let icon_prefix = match opts.icon.as_deref() {
-        Some(ic) if !ic.is_empty() => format!("{ic} "),
-        _ => String::new(),
-    };
-    let bar_text = color_span(&wrapper_color, &format!("{icon_prefix}{text}"));
-
-    let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
-        substitute(fmt, &values)
-    } else {
-        render_tooltip(outcome, snap, theme, now)
-    };
-
-    WaybarOutput {
-        text: bar_text,
-        tooltip,
-        class,
-    }
+    render_shell(
+        DEFAULT_FORMAT,
+        &build_placeholders(snap),
+        opts,
+        outcome.stale,
+        Some(severity(snap)),
+        theme,
+        render_tooltip(outcome, snap, theme, now),
+    )
 }
 
 fn render_tooltip(
@@ -184,7 +162,9 @@ fn render_tooltip(
             (
                 "󰀪",
                 theme.red.as_str(),
-                format!("HTTP {code} — Admin key required (organization settings); a project sk- key is rejected here"),
+                format!(
+                    "HTTP {code} — Admin key required (organization settings); a project sk- key is rejected here"
+                ),
             )
         };
         lines.push(TooltipLine::Body("".into()));
@@ -199,4 +179,136 @@ fn render_tooltip(
 
     let _ = now;
     render_bordered(&lines, theme)
+}
+
+// allow: SIZE_OK — one renderer plus its co-located render tests, the
+// established vendor-module shape (see anthropic_api/vendor.rs).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(
+        spent: f64,
+        limit: Option<f64>,
+        top_items: Vec<(String, f64)>,
+        last_error: Option<(u16, String)>,
+    ) -> (OpenAiApiSnapshot, VendorOutcome) {
+        let snap = OpenAiApiSnapshot {
+            spent,
+            by_day: Vec::new(),
+            top_items,
+            limit,
+        };
+        let o = VendorOutcome {
+            snapshot: crate::usage::VendorSnapshot::OpenaiApi(snap.clone()),
+            stale: false,
+            last_error,
+            cache_age: Some(std::time::Duration::from_secs(10)),
+        };
+        (snap, o)
+    }
+
+    fn opts() -> RenderOpts {
+        RenderOpts {
+            format: None,
+            tooltip_format: None,
+            icon: None,
+            pace_tolerance: 5,
+            format_pace_color: false,
+            tooltip_pace_pts: false,
+        }
+    }
+
+    #[test]
+    fn headline_with_limit_shows_spend_limit_and_pct() {
+        let (snap, o) = outcome(4.2, Some(50.0), Vec::new(), None);
+        let out = render(&o, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(out.text.contains("$4.20 / $50 · 8%"), "{}", out.text);
+        assert!(out.tooltip.contains("of $50 limit (8%)"), "{}", out.tooltip);
+    }
+
+    #[test]
+    fn headline_without_limit_shows_trailing_spend() {
+        let (snap, o) = outcome(4.2, None, Vec::new(), None);
+        let out = render(&o, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(out.text.contains("$4.20/30d"), "{}", out.text);
+        assert!(
+            out.tooltip.contains("no monthly limit set"),
+            "{}",
+            out.tooltip
+        );
+    }
+
+    #[test]
+    fn severity_scales_with_spend_pct() {
+        assert_eq!(
+            severity(&OpenAiApiSnapshot {
+                spent: 45.0,
+                by_day: Vec::new(),
+                top_items: Vec::new(),
+                limit: Some(50.0)
+            }),
+            PaceSeverity::Critical
+        );
+        assert_eq!(
+            severity(&OpenAiApiSnapshot {
+                spent: 5.0,
+                by_day: Vec::new(),
+                top_items: Vec::new(),
+                limit: Some(1000.0)
+            }),
+            PaceSeverity::Low
+        );
+        assert_eq!(
+            severity(&OpenAiApiSnapshot {
+                spent: 500.0,
+                by_day: Vec::new(),
+                top_items: Vec::new(),
+                limit: None
+            }),
+            PaceSeverity::Low
+        );
+    }
+
+    #[test]
+    fn tooltip_lists_top_line_items_with_amounts() {
+        let (snap, o) = outcome(
+            4.2,
+            None,
+            vec![("gpt-5.2".into(), 3.5), ("fine-tune job".into(), 0.7)],
+            None,
+        );
+        let out = render(&o, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(
+            out.tooltip.contains("gpt-5.2 — $3.50")
+                && out.tooltip.contains("fine-tune job — $0.70"),
+            "{}",
+            out.tooltip
+        );
+    }
+
+    #[test]
+    fn http_401_error_explains_the_admin_key_requirement() {
+        let (snap, o) = outcome(4.2, None, Vec::new(), Some((401, "bad key".into())));
+        let out = render(&o, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(
+            out.tooltip.contains("HTTP 401 — Admin key required"),
+            "{}",
+            out.tooltip
+        );
+        assert!(out.tooltip.contains("bad key"), "{}", out.tooltip);
+    }
+
+    #[test]
+    fn format_overrides_substitute_the_oai_placeholders() {
+        let (snap, o) = outcome(4.2, Some(50.0), Vec::new(), None);
+        let mut o2 = opts();
+        o2.format = Some("{vendor_short} {oai_spent} of {oai_limit} ({oai_pct}%)".into());
+        let out = render(&o, &snap, &Theme::default(), &o2, Utc::now());
+        assert!(
+            out.text.ends_with(">oai $4.20 of $50 (8%)</span>"),
+            "{}",
+            out.text
+        );
+    }
 }

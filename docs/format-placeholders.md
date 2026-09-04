@@ -15,6 +15,7 @@ metrics expand to an empty string unless noted otherwise.
 | Kilo | `klo` | Novita | `nvt` |
 | Moonshot | `msh` | Grok | `grk` |
 | SuperGrok | `sgk` | Anthropic API | `aac` |
+| OpenAI API | `oai` | | |
 | Antigravity | `agy` | Cursor | `cur` |
 | MiniMax | `mmx` | Kiro CLI | `kir` |
 | OpenCode Go | `ocg` | | |
@@ -117,9 +118,9 @@ currencies are present; otherwise they use CNY.
 
 These cover the subscription quota and rolling five-hour window from
 `api.kimi.com/coding/v1/usages`. The default format is
-`{kimi_weekly_pct}% · {kimi_weekly_reset}`. Generic aliases are `{plan}` for the
-plan, `{weekly_pct}` for weekly usage, and `{session_pct}` for the five-hour
-window.
+`5h {kimi_window_pct}% · 7d {kimi_weekly_pct}%`. Generic aliases are `{plan}`
+for the plan, `{weekly_pct}` for weekly usage, and `{session_pct}` for the
+five-hour window.
 
 ## Kilo
 

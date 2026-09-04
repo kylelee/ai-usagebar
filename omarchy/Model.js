@@ -104,9 +104,28 @@ function normalizeEntry(raw) {
     // Every window maxed / balance spent: the account has no capacity left
     // right now. Bar tiles hide; tabs and popups never do.
     exhausted: raw.exhausted === true,
+    // Precomputed by the Rust core (report.rs `headline_pick`): the figure a
+    // tile leads with. null for older binaries — headline() then walks the
+    // sections locally, under the same rule.
+    headline: normalizeHeadline(raw.headline),
     stale: raw.stale === true,
     fetched_at: cleanText(raw.fetched_at, 80),
     sections: sections
+  }
+}
+
+function normalizeHeadline(raw) {
+  if (!raw || typeof raw !== "object") return null
+  var text = cleanText(raw.text, 240)
+  if (text === "") return null
+  var severity = String(raw.severity || "")
+  if (["low", "mid", "high", "critical"].indexOf(severity) < 0) severity = "low"
+  return {
+    text: text,
+    percent: finitePercent(raw.percent),
+    severity: severity,
+    label: cleanText(raw.label, 160),
+    reset_at: cleanText(raw.reset_at, 80)
   }
 }
 
@@ -509,6 +528,19 @@ function tiledBarLabel(alarming, vertical, showValue, loading, entries,
 
 function headline(entry) {
   if (!entry) return { text: "", percent: null, severity: "low", label: "", reset_at: "" }
+  // The Rust core precomputes the pick (report.rs `headline_pick`); trust it
+  // when present. Older binaries fall through to the local walk below,
+  // which implements the same rule.
+  if (entry.headline) {
+    var pre = entry.headline
+    return {
+      text: pre.text,
+      percent: pre.percent,
+      severity: pre.severity,
+      label: pre.label,
+      reset_at: pre.reset_at
+    }
+  }
   var best = null
   var sections = entry.sections || []
   for (var i = 0; i < sections.length; i++) {

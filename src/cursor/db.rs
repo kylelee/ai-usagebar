@@ -70,7 +70,7 @@ pub fn read_access_token(path: &Path) -> Result<String> {
             |row| row.get(0),
         )
         .map_err(|_| {
-            AppError::Credentials(format!(
+            AppError::Unconfigured(format!(
                 "no Cursor session found in {}. Sign in to the Cursor IDE, then try again.",
                 sanitize_untrusted_path(path)
             ))
@@ -268,12 +268,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_row_is_a_credentials_error() {
+    fn missing_row_is_the_unconfigured_sign_in_remedy() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.vscdb");
         seed_db(&path, None);
         let err = read_access_token(&path).unwrap_err();
-        assert!(matches!(err, AppError::Credentials(_)));
+        // Display is byte-identical to the pre-variant text (Credentials').
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "credentials error: no Cursor session found in {}. Sign in to the Cursor IDE, then try again.",
+                path.display()
+            )
+        );
+        assert!(
+            matches!(err, AppError::Unconfigured(_)),
+            "expected the Unconfigured remedy, got {err:?}"
+        );
     }
 
     #[test]
@@ -431,11 +442,11 @@ mod tests {
 
         let err = resolve_access_token(&db_path, &agent_path).unwrap_err();
         match err {
-            AppError::Credentials(m) => {
+            AppError::Unconfigured(m) => {
                 assert!(m.contains(&db_path.display().to_string()));
                 assert!(!m.contains(&agent_path.display().to_string()));
             }
-            other => panic!("expected Credentials error, got {other:?}"),
+            other => panic!("expected the IDE sign-in remedy, got {other:?}"),
         }
     }
 

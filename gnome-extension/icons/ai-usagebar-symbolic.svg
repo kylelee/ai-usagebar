@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- ai-usagebar symbolic mark: monochrome robot head (antenna, eyes, mouth).
+       Single fill so GNOME recolors it with the panel theme like any
+       -symbolic icon; eyes and mouth are evenodd holes in the silhouette. -->
+  <path fill="#bebebe" fill-rule="evenodd" d="M8 1a1 1 0 0 1 1 1v1h3.5A2.5 2.5 0 0 1 15 5.5v5a2.5 2.5 0 0 1-2.5 2.5h-9A2.5 2.5 0 0 1 1 10.5v-5A2.5 2.5 0 0 1 3.5 3H7V2a1 1 0 0 1 1-1zm1 4.5a1.5 1.5 0 1 0-3 0 1.5 1.5 0 1 0 3 0zm5 0a1.5 1.5 0 1 0-3 0 1.5 1.5 0 1 0 3 0zM5 9.5h6a.5.5 0 1 1 0 1H5a.5.5 0 1 1 0-1z"/>
+</svg>

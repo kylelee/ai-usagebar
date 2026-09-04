@@ -11,8 +11,9 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::pacing::PaceSeverity;
+use crate::pacing::{self, PaceSeverity};
 use crate::pango::{color_span, escape, severity_color};
+use crate::report::{HeadlinePick, headline_pick};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::tui::app::{TabId, TabState};
@@ -21,7 +22,7 @@ use crate::vendor::RenderOpts;
 use crate::waybar::{Class, WaybarOutput};
 
 /// The pacing tolerance the report and the TUI panels use.
-const PACE_TOLERANCE: u32 = 5;
+const PACE_TOLERANCE: u32 = pacing::DEFAULT_TOLERANCE;
 
 /// One account's tile: everything the bar line and the popup block need.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +102,6 @@ impl AggregateEntry {
         // Like the report: an error is already a first-class field, and the
         // sections an Error tab projects carry the TUI's interactive retry
         // instructions — not data for a bar tooltip.
-        let mut best: Option<HeadlineMetric> = None;
         if error.is_none() {
             for projected in sections_with_metadata_for(state, now, PACE_TOLERANCE) {
                 let SectionProjection {
@@ -117,14 +117,6 @@ impl AggregateEntry {
                         value_label,
                         ..
                     } => {
-                        if best.as_ref().is_none_or(|metric| pct > metric.pct) {
-                            best = Some(HeadlineMetric {
-                                label: label.clone(),
-                                pct,
-                                value: value_label.clone(),
-                                severity,
-                            });
-                        }
                         sections.push(SectionRow {
                             label,
                             percent: Some(pct),
@@ -149,32 +141,41 @@ impl AggregateEntry {
             }
         }
 
+        // The headline rule lives in the report (`headline_pick`): the
+        // fullest metric wins, else the first balance-style text row. The
+        // same pick drives the tile's headline, its severity, and its bar
+        // figures, so the three can never disagree.
+        let pick = headline_pick(
+            sections
+                .iter()
+                .map(|row| (row.label.as_str(), row.percent, row.value.as_str())),
+        );
+        let severity = match pick {
+            Some(HeadlinePick::Metric(index)) => sections[index].severity,
+            _ => PaceSeverity::Low,
+        };
+
         // Error rows keep their sections (there are none today) but lose the
-        // headline: the tile shows the warning mark instead.
+        // headline: the tile shows the warning mark instead. A ready entry
+        // with nothing reportable also has no headline.
         let headline = if error.is_some() {
             None
         } else {
-            headline_figure(best.as_ref(), &sections)
+            pick.map(|pick| headline_text(&sections, Some(pick)))
         };
-        let severity = best
-            .as_ref()
-            .map(|metric| metric.severity)
-            .unwrap_or(PaceSeverity::Low);
         let figures = if error.is_some() {
             Vec::new()
         } else {
-            tile_figures(&sections, best.as_ref())
+            tile_figures(&sections, pick)
         };
         // Same rule the report ships (`report::rows_exhausted`): any maxed
         // window or spent balance hides the tile from the bar.
         let exhausted = error.is_none()
-            && crate::report::rows_exhausted(sections.iter().map(|row| {
-                (
-                    row.label.as_str(),
-                    row.percent,
-                    row.value.as_str(),
-                )
-            }));
+            && crate::report::rows_exhausted(
+                sections
+                    .iter()
+                    .map(|row| (row.label.as_str(), row.percent, row.value.as_str())),
+            );
 
         Self {
             label,
@@ -204,7 +205,7 @@ pub struct TileFigure {
 
 /// The tile's figures: the 5h window first, then the weekly one, each with
 /// its own reset; the headline figure when neither exists.
-fn tile_figures(sections: &[SectionRow], best: Option<&HeadlineMetric>) -> Vec<TileFigure> {
+fn tile_figures(sections: &[SectionRow], pick: Option<HeadlinePick>) -> Vec<TileFigure> {
     let mut session = None;
     let mut weekly = None;
     for row in sections {
@@ -226,57 +227,32 @@ fn tile_figures(sections: &[SectionRow], best: Option<&HeadlineMetric>) -> Vec<T
             .collect();
     }
     // No windows (balance-style accounts): the single headline figure.
-    best.and_then(|metric| {
-        let text = headline_figure(Some(metric), &[]);
-        text.map(|text| {
-            vec![TileFigure {
-                text,
-                reset_at: None,
-                is_window: false,
-            }]
-        })
-    })
-    .unwrap_or_default()
-}
-
-/// The fullest metric, as picked by [`AggregateEntry::from_tab`] — what
-/// drives severity and the no-window fallback.
-struct HeadlineMetric {
-    label: String,
-    pct: u16,
-    value: String,
-    severity: PaceSeverity,
-}
-
-/// The single figure a tile leads with. Rule shared with `Model.headline`:
-/// the fullest metric's percent, except balance-style metrics whose value
-/// string is the figure.
-fn headline_figure(best: Option<&HeadlineMetric>, sections: &[SectionRow]) -> Option<String> {
-    if let Some(HeadlineMetric {
-        label,
-        pct,
-        value,
-        ..
-    }) = best
-    {
-        return Some(
-            if label.to_lowercase().contains("balance") && !value.is_empty() {
-                value.clone()
-            } else {
-                format!("{pct}%")
-            },
-        );
+    match pick {
+        Some(pick) => vec![TileFigure {
+            text: headline_text(sections, Some(pick)),
+            reset_at: None,
+            is_window: false,
+        }],
+        None => Vec::new(),
     }
-    sections
-        .iter()
-        .find(|row| {
-            row.percent.is_none()
-                && !row.value.is_empty()
-                && ["balance", "available", "spend", "prepaid"]
-                    .iter()
-                    .any(|word| row.label.to_lowercase().contains(word))
-        })
-        .map(|row| row.value.clone())
+}
+
+/// The single figure a tile leads with. Rule shared with `Model.headline`
+/// via the report's `headline_pick`: the fullest metric's percent, except
+/// balance-style metrics whose value string is the figure.
+fn headline_text(sections: &[SectionRow], pick: Option<HeadlinePick>) -> String {
+    match pick {
+        Some(HeadlinePick::Metric(index)) => {
+            let row = &sections[index];
+            if row.label.to_lowercase().contains("balance") && !row.value.is_empty() {
+                row.value.clone()
+            } else {
+                format!("{}%", row.percent.unwrap_or_default())
+            }
+        }
+        Some(HeadlinePick::BalanceRow(index)) => sections[index].value.clone(),
+        None => String::new(),
+    }
 }
 
 /// `PaceSeverity` has no ordering (it is presentation, not magnitude); the
@@ -339,7 +315,12 @@ fn worst_class(entries: &[AggregateEntry]) -> Class {
 /// exhausted ones (any window maxed, balance spent): a tile that is all
 /// zeros is noise until its reset lands. Both stay in the popup; a bar is
 /// not the place to nag.
-fn render_bar_text(entries: &[AggregateEntry], theme: &Theme, opts: &RenderOpts, now: DateTime<Utc>) -> String {
+fn render_bar_text(
+    entries: &[AggregateEntry],
+    theme: &Theme,
+    opts: &RenderOpts,
+    now: DateTime<Utc>,
+) -> String {
     let tiles: Vec<String> = entries
         .iter()
         .filter(|entry| entry.error.is_none() && !entry.exhausted)
@@ -375,10 +356,23 @@ fn render_bar_text(entries: &[AggregateEntry], theme: &Theme, opts: &RenderOpts,
         })
         .collect();
     if tiles.is_empty() {
-        // Every account failed: no tiles to show, but never an empty module.
-        return match opts.icon.as_deref() {
+        // No tiles to show, but never an empty module. A module whose
+        // accounts hard-failed (any non-unconfigured error) carries the same
+        // ⚠ identity as the single-vendor fallback (waybar's
+        // `WaybarOutput::error`), so a broken aggregate is visible on the
+        // bar and not only on hover; calm states — routine not-configured,
+        // all-exhausted — keep the bare vendor icon.
+        let icon = match opts.icon.as_deref() {
             Some(ic) if !ic.is_empty() => ic.to_string(),
             _ => "󰚩".to_string(),
+        };
+        let hard_failure = entries
+            .iter()
+            .any(|entry| entry.error.is_some() && !entry.unconfigured);
+        return if hard_failure {
+            format!("⚠ {icon}")
+        } else {
+            icon
         };
     }
     // No padding spaces around the divider — the │ glyph has whitespace of
@@ -422,11 +416,12 @@ fn render_tooltip(entries: &[AggregateEntry], theme: &Theme, now: DateTime<Utc>)
         )));
 
         if let Some(error) = &entry.error {
-            lines.push(TooltipLine::Body(format!(
-                " <span foreground='{}'>  {}</span>",
-                theme.red,
-                escape(error)
-            )));
+            for wrapped in crate::widget::render::wrap_words(&escape(error), 35) {
+                lines.push(TooltipLine::Body(format!(
+                    " <span foreground='{}'>  {}</span>",
+                    theme.red, wrapped
+                )));
+            }
         }
         for row in &entry.sections {
             let color = severity_color(row.severity, theme);
@@ -570,7 +565,10 @@ mod tests {
             ),
         ];
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
-        assert!(!text.contains("kmi"), "error tile leaked into the bar: {text}");
+        assert!(
+            !text.contains("kmi"),
+            "error tile leaked into the bar: {text}"
+        );
         assert!(!text.contains("⚠"), "{text}");
         assert!(text.contains("zai"), "{text}");
         assert_eq!(worst_class(&entries), Class::Critical);
@@ -613,11 +611,18 @@ mod tests {
                 window_duration: chrono::Duration::days(7),
             });
         }
-        let entries = vec![AggregateEntry::from_tab(&TabId::vendor(VendorId::Zai), &state, now)];
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Zai),
+            &state,
+            now,
+        )];
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
         assert!(text.contains("42%·2h"), "{text}");
         assert!(text.contains("15%·2.1d"), "{text}");
-        assert!(!text.contains(" · "), "old single-figure spacing leaked: {text}");
+        assert!(
+            !text.contains(" · "),
+            "old single-figure spacing leaked: {text}"
+        );
     }
 
     /// A window that has not started (no reset reported) keeps its countdown
@@ -626,7 +631,11 @@ mod tests {
     fn unstarted_window_keeps_a_dash_placeholder() {
         let now = Utc::now();
         let state = zai_state(0);
-        let entries = vec![AggregateEntry::from_tab(&TabId::vendor(VendorId::Zai), &state, now)];
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Zai),
+            &state,
+            now,
+        )];
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
         assert!(text.contains("0%·-"), "{text}");
     }
@@ -645,8 +654,14 @@ mod tests {
         assert!(entries[0].exhausted);
         assert!(!entries[1].exhausted);
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
-        assert!(!text.contains("100%"), "exhausted tile leaked into the bar: {text}");
-        assert!(!text.contains("│"), "a single tile must not draw a separator: {text}");
+        assert!(
+            !text.contains("100%"),
+            "exhausted tile leaked into the bar: {text}"
+        );
+        assert!(
+            !text.contains("│"),
+            "a single tile must not draw a separator: {text}"
+        );
         assert!(text.contains("30%"), "{text}");
 
         // The popup still shows the maxed account with its figures.
@@ -668,6 +683,46 @@ mod tests {
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
         assert!(!text.is_empty());
         assert!(!text.contains("│"), "{text}");
+    }
+
+    /// A long error row must wrap instead of stretching the bordered box:
+    /// rows carry a 3-column indent, so 35-wrap keeps every row ≤ 38 visible
+    /// columns and the inner box ≤ 40.
+    #[test]
+    fn long_error_rows_wrap_inside_the_box() {
+        let now = Utc::now();
+        let err = "connection reset by peer while the refresh request traveled \
+                   upstream toward the provider, please retry shortly after a moment"
+            .to_string();
+        assert!(err.chars().count() > 35);
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Kimi),
+            &TabState::Error(err.clone()),
+            now,
+        )];
+        let tooltip = render_tooltip(&entries, &Theme::default(), now);
+
+        // No content lost to the wrap.
+        for word in err.split_whitespace() {
+            assert!(tooltip.contains(word), "lost {word}: {tooltip}");
+        }
+        // The error spans multiple rows (pre-fix it stayed on one).
+        let err_rows = tooltip
+            .lines()
+            .filter(|l| {
+                ["connection", "upstream", "retry"]
+                    .iter()
+                    .any(|w| l.contains(w))
+            })
+            .count();
+        assert!(err_rows >= 2, "error stayed on one row: {tooltip}");
+        // Box width bounded: the top border's ─ run is the inner width
+        // (pre-fix an unwrapped row pushed it past 100).
+        let dashes = tooltip.lines().next().unwrap().matches('─').count();
+        assert!(
+            dashes <= 40,
+            "tooltip box grew to {dashes} columns: {tooltip}"
+        );
     }
 
     #[test]
@@ -709,5 +764,67 @@ mod tests {
         }));
         let entry = AggregateEntry::from_tab(&TabId::vendor(VendorId::Openrouter), &state, now);
         assert_eq!(entry.headline.as_deref(), Some("$1.34"));
+    }
+
+    /// Every account hard-failed (a non-unconfigured error): the module
+    /// carries the single-vendor fallback's ⚠ identity instead of a silent
+    /// bare icon — an all-errors aggregate is a fault, not "nothing to show".
+    #[test]
+    fn all_error_entries_lead_with_the_warning_cue() {
+        let now = Utc::now();
+        let entries = vec![
+            AggregateEntry::from_tab(
+                &TabId::vendor(VendorId::Kimi),
+                &TabState::Error("HTTP 503 upstream".into()),
+                now,
+            ),
+            AggregateEntry::from_tab(
+                &TabId::vendor(VendorId::Kilo),
+                &TabState::Error("HTTP 500".into()),
+                now,
+            ),
+        ];
+        let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
+        assert!(text.starts_with("⚠"), "{text}");
+
+        let mut with_icon = opts();
+        with_icon.icon = Some("▶".into());
+        let text = render_bar_text(&entries, &Theme::default(), &with_icon, now);
+        assert!(text.starts_with("⚠"), "{text}");
+        assert!(text.contains("▶"), "icon dropped from the cue: {text}");
+    }
+
+    /// Regression pin: every working account exhausted keeps the plain bare
+    /// icon — exhaustion is calm (the reset arrives with the next report),
+    /// not the failure cue's business.
+    #[test]
+    fn all_exhausted_entries_keep_the_bare_icon_without_a_warning() {
+        let now = Utc::now();
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Zai),
+            &zai_state(100),
+            now,
+        )];
+        let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
+        assert_eq!(text, "󰚩");
+        assert!(!text.contains("⚠"), "{text}");
+    }
+
+    /// All-unconfigured fixture (errors carrying the report's real
+    /// not-configured markers): plain icon, no false ⚠.
+    #[test]
+    fn all_unconfigured_errors_keep_the_plain_icon() {
+        let now = Utc::now();
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Kimi),
+            &TabState::Error(
+                "Kimi: no API key. Either set the environment variable or add api_key in config"
+                    .into(),
+            ),
+            now,
+        )];
+        let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
+        assert_eq!(text, "󰚩");
+        assert!(!text.contains("⚠"), "{text}");
     }
 }

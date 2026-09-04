@@ -50,10 +50,34 @@ KCM.SimpleKCM {
         }
     }
 
-    Component.onCompleted: {
-        prober.connectSource(Logic.buildCommand(
-            page.cfg_binaryPath, page.cfg_commandTimeout));
+    // The probe key is the built command string, so a re-trigger with
+    // unchanged settings is a no-op, and the previous command's source is
+    // disconnected before a new one connects — the data engine cannot kill a
+    // started child, so the spawns must never stack.
+    property string lastProbeCommand: ""
+
+    // Field edits land here first: editing the path or stepping the spinner
+    // restarts this, so a burst of changes yields ONE probe after the last
+    // change rather than one spawn per keystroke/step.
+    Timer {
+        id: probeDebounce
+        interval: 500
+        onTriggered: page.runVendorProbe()
     }
+
+    function runVendorProbe() {
+        const cmd = Logic.buildCommand(
+            page.cfg_binaryPath, page.cfg_commandTimeout);
+        if (cmd === page.lastProbeCommand)
+            return;
+        if (prober.connectedSources.indexOf(page.lastProbeCommand) !== -1)
+            prober.disconnectSource(page.lastProbeCommand);
+        page.lastProbeCommand = cmd;
+        page.probing = true;
+        prober.connectSource(cmd);
+    }
+
+    Component.onCompleted: page.runVendorProbe()
 
     // The report owns the canonical display name, so there is no second table
     // here to drift out of sync with it. Falls back to the raw id while the
@@ -163,6 +187,7 @@ KCM.SimpleKCM {
             from: 60
             to: 3600
             stepSize: 60
+            onValueChanged: probeDebounce.restart()
         }
 
         QQC2.ComboBox {
@@ -250,6 +275,11 @@ KCM.SimpleKCM {
             id: binaryField
             Kirigami.FormData.label: i18n("Binary path (empty = auto):")
             placeholderText: i18n("empty = look on PATH")
+            // editingFinished (focus loss / Return), not textChanged: one probe
+            // per committed edit, and it does not fire on Plasma's initial
+            // binding of the saved value. An empty path still re-probes — it
+            // means "look on PATH" and can legitimately fix a not-found state.
+            onEditingFinished: probeDebounce.restart()
         }
 
         QQC2.Label {

@@ -21,6 +21,10 @@
 # Presentation of vendor tab navigation: sidebar (vertical box) | navbar (top strip) | none (hidden).
 # Default sidebar (falls back to navbar on narrow terminals).
 # vendor_box = "sidebar"
+# macOS menu-bar app only — every other frontend ignores these. The status-bar
+# overview draws one mini bar per vendor while they fit, then plain numbers.
+# overview_menubar_bars_max = 4   # bars -> numbers above this many entries (default 4)
+# overview_menubar_max = 4        # numbers shown before a "+K" overflow (default 4)
 
 # Optional, TUI-only monitor for local Claude Code session context. When
 # enabled, press `c` in ai-usagebar-tui. The scanner reads only bounded tails

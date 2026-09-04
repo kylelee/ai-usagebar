@@ -80,11 +80,24 @@ cargo install --git https://github.com/KyleLee/ai-usagebar-omarchy
 omarchy plugin add https://github.com/KyleLee/ai-usagebar-omarchy.git --enable
 ```
 
+Step 1 compiles from source. On Arch-based systems your AUR helper can
+install the same thing without a local clone:
+
+```bash
+yay -S ai-usagebar-omarchy           # or your AUR helper of choice (paru, …); builds from source
+yay -S ai-usagebar-omarchy-bin       # prebuilt binaries from the GitHub Releases
+```
+
+Anywhere with Rust, `cargo binstall ai-usagebar` fetches those same release
+binaries instead of compiling (install the helper once with
+`cargo install cargo-binstall`).
+
 No Rust yet? Install it from <https://rustup.rs> first — `cargo install`
 builds both `ai-usagebar-omarchy` and `ai-usagebar-omarchy-tui` into
 `~/.cargo/bin` (make sure that directory is on your session PATH so the
 Omarchy shell can find the binary). Update later by re-running the same
-command with `--force`.
+command with `--force`. The AUR packages and `cargo binstall` also drop both
+binaries on your PATH.
 
 Optionally hide the stock Agents widget to avoid duplicates:
 
@@ -95,10 +108,11 @@ omarchy plugin disable omarchy.agents
 That's it — the bar immediately tiles every configured account (right-click
 launches the TUI; cargo installed it too). Nothing configured yet? Click the
 bar icon → gear (`s`) → **ACCOUNTS** → **Add account** → pick the provider
-(Z.AI / Kimi) → paste the API key (the name is pre-filled, editable) →
-**Apply**. Z.AI team keys also select the `team` billing type and paste the
-two organization ids; the site (z.ai / bigmodel.cn) is auto-detected from
-the type.
+(Z.AI / Kimi) → paste the API key → **Apply** — that is all an account needs.
+It is auto-named by its position in the vendor's list (1, 2, …), and
+`--account 2` selects the second one. Z.AI team keys also select the `team`
+billing type and paste the two organization ids; the site
+(z.ai / bigmodel.cn) is auto-detected from the type.
 
 Left-click the widget opens the native Quattro panel; middle-click / wheel
 switches providers. The first run also drops a fully commented template at
@@ -244,6 +258,30 @@ enabled = true
 See the [configuration reference](docs/configuration.md) for every provider,
 display option, account path, region, and API-key setting.
 
+### Settings bridge
+
+Native frontends do not parse your `config.toml` themselves; they go through
+two administrative subcommands:
+
+```bash
+# Non-secret JSON description of the current settings: the primary vendor
+# and which key fields each vendor offers. Never prints a key.
+ai-usagebar-omarchy settings show
+
+# Apply one JSON patch read from standard input — keys never appear in argv
+# or the process environment.
+echo '{"schema_version":1,"keys":{"kimi":{"action":"set","value":"..."}}}' \
+    | ai-usagebar-omarchy settings apply
+```
+
+A patch carries an optional `primary` vendor slug and a `keys` map; each key
+entry is `{"action":"set","value":…}`, `{"action":"clear"}`, or
+`{"action":"fields","fields":{…}}` for vendor-specific values (Z.AI team ids,
+monthly limits). Saving a non-empty key also sets that vendor's
+`enabled = true`, exactly like the TUI overlay. This is the protocol the
+Omarchy settings form speaks; it edits the same `config.toml` documented
+above, through the same `toml_edit` path.
+
 ## Quick start
 
 ```bash
@@ -267,7 +305,8 @@ ai-usagebar-omarchy usage --json | jq '.entries[] | {id, metrics, sections}'
 
 # Tile every enabled vendor AND account in one bar module — one compact
 # tile per account (team 42% │ kmi 18% │ cld 5%), hover for the combined
-# report. The taskbar equivalent of the GNOME panel's multi-key layout.
+# report. The taskbar equivalent of the GNOME extension's multi-account
+# tiling.
 ai-usagebar-omarchy --vendor all
 
 # Live preview while iterating on --format / --tooltip-format.
@@ -510,8 +549,10 @@ ai-usagebar-omarchy --watch 5                              # iterate on --format
 ai-usagebar-omarchy --vendor openrouter --format '{or_balance} · today {or_used_today}'
 
 make test                                          # unit + integration
-source ~/.config/zsh/secrets                       # required for existing vendor smoke tests
-make smoke                                         # runs all ignored tests; only Kimi skips without its key
+source ~/.config/zsh/secrets                       # optional: load your real keys for smoke tests
+make smoke                                         # 21 live API smoke tests — every vendor skips itself when
+                                                   # its credential is missing, so run it with the keys you have;
+                                                   # a bogus key fails fast against the real endpoint
 make clippy                                        # cargo clippy -D warnings
 ```
 
@@ -617,6 +658,7 @@ After saving:
 - One Dark palette by default.
 - Auto-merges with the active Omarchy theme at `~/.config/omarchy/current/theme/colors.toml`.
 - Per-color overrides: `--color-low`, `--color-mid`, `--color-high`, `--color-critical` (claudebar-compatible).
+- Pacing calibers (claudebar-compatible): `--pace-tolerance <pp>` widens or narrows the band (percentage points, default 5) for ratio-based pace icons; `--format-pace-color` colors each pace placeholder by its own window instead of the global usage color; `--tooltip-pace-pts` switches the tooltip's pace column to point-based pacing and adds an elapsed-position marker on its progress bars.
 
 ## Changelog
 

@@ -1,11 +1,14 @@
 //! Settings overlay — opened from the TUI by pressing `s`. Lets the user pick
-//! the primary vendor and paste an API key for any key-authenticated vendor
-//! (including Z.AI, Kimi, MiniMax, and the balance vendors) without hand-editing
+//! the primary vendor, paste an API key for any key-authenticated vendor
+//! (including Z.AI, Kimi, MiniMax, and the balance vendors), and set the
+//! Admin-API vendors' default-section `monthly_limit` without hand-editing
 //! config.toml. Anthropic, OpenAI, Cursor, and Antigravity authenticate through
 //! local product state, so they have no key field here. Kimi keeps its key
 //! field because a platform key is still one of its two credentials, but a
 //! subscriber whose credential is the Kimi Code CLI login has nothing to paste
-//! and enables `[kimi]` in config.toml instead.
+//! and enables `[kimi]` in config.toml instead. Per-account limits
+//! (`[[vendor.accounts]] monthly_limit`) stay config-file/Omarchy-form
+//! territory — the overlay edits the default section only.
 //!
 //! Persistence uses `toml_edit` so the existing config keeps its comments,
 //! whitespace, and unrelated fields. Writing a key also flips that vendor's
@@ -19,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui_bubbletea_theme::BubbleTheme;
@@ -29,7 +32,7 @@ use toml_edit::{DocumentMut, value};
 use crate::config::{Config, ZaiAccountType};
 use crate::error::{AppError, Result};
 use crate::theme::Theme;
-use crate::tui::style::bubble_theme;
+use crate::tui::style::{bubble_theme, color};
 use crate::vendor::VendorId;
 
 /// A vendor that authenticates with an inline API key (vs. OAuth). The order of
@@ -42,6 +45,10 @@ pub struct KeyVendor {
     pub section: &'static str,
     /// Extra hint after the env var (e.g. "management key"). Empty for none.
     pub note: &'static str,
+    /// Renders the extra numeric `monthly_limit` row (the DEFAULT section's
+    /// spend cap, reused by both Admin-API vendors). Per-account limits are
+    /// not editable here — they stay config-file/Omarchy-form territory.
+    pub monthly_limit: bool,
 }
 
 pub const KEY_VENDORS: &[KeyVendor] = &[
@@ -51,6 +58,15 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "ANTHROPIC_ADMIN_KEY",
         section: "anthropic_api",
         note: "admin key — monthly spend",
+        monthly_limit: true,
+    },
+    KeyVendor {
+        id: VendorId::OpenaiApi,
+        label: "OpenAI API",
+        env: "OPENAI_ADMIN_KEY",
+        section: "openai_api",
+        note: "admin key — 30-day spend",
+        monthly_limit: true,
     },
     KeyVendor {
         id: VendorId::Zai,
@@ -58,6 +74,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "ZAI_API_KEY",
         section: "zai",
         note: "",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Openrouter,
@@ -65,6 +82,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "OPENROUTER_API_KEY",
         section: "openrouter",
         note: "",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Deepseek,
@@ -72,6 +90,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "DEEPSEEK_API_KEY",
         section: "deepseek",
         note: "",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Kimi,
@@ -79,6 +98,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "KIMI_API_KEY",
         section: "kimi",
         note: "coding-plan usage",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Kilo,
@@ -86,6 +106,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "KILO_API_KEY",
         section: "kilo",
         note: "",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Novita,
@@ -93,6 +114,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "NOVITA_API_KEY",
         section: "novita",
         note: "",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Moonshot,
@@ -100,6 +122,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "MOONSHOT_API_KEY",
         section: "moonshot",
         note: "account balance",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Grok,
@@ -107,6 +130,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "XAI_MANAGEMENT_KEY",
         section: "grok",
         note: "management key, not the inference key",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::Minimax,
@@ -114,6 +138,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "MINIMAX_API_KEY",
         section: "minimax",
         note: "Token Plan subscription key",
+        monthly_limit: false,
     },
     KeyVendor {
         id: VendorId::OpenCodeGo,
@@ -121,42 +146,50 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         env: "OPENCODE_GO_API_KEY",
         section: "opencode-go",
         note: "usage quota",
+        monthly_limit: false,
     },
 ];
 
-/// Read the inline `api_key` currently in config for a given section, so the
-/// field opens pre-filled (masked) when one is already set.
-fn config_inline_key<'a>(cfg: &'a Config, section: &str) -> Option<&'a str> {
-    match section {
-        "anthropic_api" => cfg.anthropic_api.api_key.as_deref(),
-        "zai" => cfg.zai.api_key.as_deref(),
-        "openrouter" => cfg.openrouter.api_key.as_deref(),
-        "deepseek" => cfg.deepseek.api_key.as_deref(),
-        "kimi" => cfg.kimi.api_key.as_deref(),
-        "kilo" => cfg.kilo.api_key.as_deref(),
-        "novita" => cfg.novita.api_key.as_deref(),
-        "moonshot" => cfg.moonshot.api_key.as_deref(),
-        "grok" => cfg.grok.api_key.as_deref(),
-        "minimax" => cfg.minimax.api_key.as_deref(),
-        "opencode-go" => cfg.opencode_go.api_key.as_deref(),
-        _ => None,
-    }
-}
-
-/// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`].
+/// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`];
+/// `Limit(i)` is that vendor's `monthly_limit` row (only reachable for
+/// entries with `monthly_limit: true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Primary,
     Key(usize),
+    Limit(usize),
     Save,
+}
+
+fn next_key_or_save(i: usize) -> Focus {
+    if i + 1 < KEY_VENDORS.len() {
+        Focus::Key(i + 1)
+    } else {
+        Focus::Save
+    }
+}
+
+fn last_field_focus() -> Focus {
+    let last = KEY_VENDORS.len() - 1;
+    if KEY_VENDORS[last].monthly_limit {
+        Focus::Limit(last)
+    } else {
+        Focus::Key(last)
+    }
 }
 
 impl Focus {
     pub fn next(self) -> Self {
         match self {
             Focus::Primary => Focus::Key(0),
-            Focus::Key(i) if i + 1 < KEY_VENDORS.len() => Focus::Key(i + 1),
-            Focus::Key(_) => Focus::Save,
+            Focus::Key(i) => {
+                if KEY_VENDORS.get(i).is_some_and(|kv| kv.monthly_limit) {
+                    Focus::Limit(i)
+                } else {
+                    next_key_or_save(i)
+                }
+            }
+            Focus::Limit(i) => next_key_or_save(i),
             Focus::Save => Focus::Primary,
         }
     }
@@ -164,8 +197,15 @@ impl Focus {
         match self {
             Focus::Primary => Focus::Save,
             Focus::Key(0) => Focus::Primary,
-            Focus::Key(i) => Focus::Key(i - 1),
-            Focus::Save => Focus::Key(KEY_VENDORS.len() - 1),
+            Focus::Key(i) => {
+                if KEY_VENDORS.get(i - 1).is_some_and(|kv| kv.monthly_limit) {
+                    Focus::Limit(i - 1)
+                } else {
+                    Focus::Key(i - 1)
+                }
+            }
+            Focus::Limit(i) => Focus::Key(i),
+            Focus::Save => last_field_focus(),
         }
     }
 }
@@ -274,6 +314,10 @@ pub struct SettingsState {
     pub primary: VendorId,
     /// One input per [`KEY_VENDORS`] entry, same order.
     pub keys: Vec<KeyInput>,
+    /// The optional numeric `monthly_limit` row per [`KEY_VENDORS`] entry,
+    /// same order (kept blank for vendors without the row). Plain text —
+    /// only the key fields are masked.
+    pub limits: Vec<KeyInput>,
     /// Non-secret Z.AI account fields (billing type, site, team ids). The
     /// terminal overlay round-trips them untouched; the native settings form
     /// edits them. Saving always writes them back to `[zai]`.
@@ -315,11 +359,39 @@ impl ZaiFields {
     }
 }
 
+/// The DEFAULT section's `monthly_limit` — the value the overlay's limit
+/// row edits. Only the Admin-spend vendors have one.
+fn default_section_limit(cfg: &Config, id: VendorId) -> Option<f64> {
+    match id {
+        VendorId::AnthropicApi => cfg.anthropic_api.monthly_limit,
+        VendorId::OpenaiApi => cfg.openai_api.monthly_limit,
+        _ => None,
+    }
+}
+
+/// A limit row's text input: plain text (never masked), prefilled with the
+/// current limit, untouched until the user edits it.
+fn limit_input(initial: Option<&str>) -> KeyInput {
+    let mut input = KeyInput::from_config(initial);
+    input.revealed = true;
+    input
+}
+
 impl SettingsState {
     pub fn from_config(cfg: &Config) -> Self {
         let keys = KEY_VENDORS
             .iter()
-            .map(|kv| KeyInput::from_config(config_inline_key(cfg, kv.section)))
+            .map(|kv| KeyInput::from_config(cfg.inline_api_key(kv.id)))
+            .collect();
+        let limits = KEY_VENDORS
+            .iter()
+            .map(|kv| {
+                limit_input(
+                    default_section_limit(cfg, kv.id)
+                        .map(|l| l.to_string())
+                        .as_deref(),
+                )
+            })
             .collect();
         let primary_choices = cfg.enabled_vendors();
         // A configured but disabled primary is ineffective. Display the first
@@ -336,6 +408,7 @@ impl SettingsState {
             primary_choices,
             primary,
             keys,
+            limits,
             zai: ZaiFields::from_config(cfg),
             status: String::new(),
         }
@@ -433,6 +506,11 @@ pub fn handle_key(state: &mut SettingsState, code: KeyCode, mods: KeyModifiers) 
                 handle_input(input, code);
             }
         }
+        Focus::Limit(i) => {
+            if let Some(input) = state.limits.get_mut(i) {
+                handle_input(input, code);
+            }
+        }
         Focus::Save => {
             if matches!(code, KeyCode::Enter) {
                 return try_save(state);
@@ -522,6 +600,11 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
             continue;
         };
         update_key(&mut doc, kv.section, input)?;
+        if kv.monthly_limit
+            && let Some(limit) = state.limits.get(i)
+        {
+            update_limit(&mut doc, kv, limit)?;
+        }
     }
     update_zai_fields(&mut doc, &state.zai)?;
 
@@ -557,6 +640,45 @@ fn update_key(doc: &mut DocumentMut, section: &str, input: &KeyInput) -> Result<
     // Trimmed: pasted keys drag trailing whitespace/newlines along.
     set_string(doc, section, "api_key", input.buf.trim())?;
     set_bool(doc, section, "enabled", true)
+}
+
+/// Apply the limit row to the DEFAULT section. Untouched rows are left
+/// alone; a cleared row removes `monthly_limit` (blank = no limit); a value
+/// is validated before it reaches the file.
+fn update_limit(doc: &mut DocumentMut, kv: &KeyVendor, input: &KeyInput) -> Result<()> {
+    if !input.dirty {
+        return Ok(());
+    }
+    let Some(value) = parse_monthly_limit(kv.label, &input.buf)? else {
+        if let Some(table) = doc
+            .get_mut(kv.section)
+            .and_then(toml_edit::Item::as_table_mut)
+        {
+            table.remove("monthly_limit");
+        }
+        return Ok(());
+    };
+    set_number(doc, kv.section, "monthly_limit", value)
+}
+
+/// Shared numeric validation for every `monthly_limit` edit (the overlay's
+/// typing path and the apply patches alike): blank clears, anything
+/// non-numeric, non-finite, or ≤ 0 is rejected with a message.
+fn parse_monthly_limit(label: &str, raw: &str) -> Result<Option<f64>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value: f64 = trimmed.parse().map_err(|_| {
+        AppError::Other(format!("{label} monthly_limit {trimmed:?} is not a number"))
+    })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(AppError::Other(format!(
+            "{label} monthly_limit must be finite and greater than zero; clear the field to \
+             show spend without a limit"
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// Persist the Z.AI fields: a value equal to the default removes the key
@@ -600,6 +722,25 @@ fn set_string(doc: &mut DocumentMut, section: &str, key: &str, new_value: &str) 
 
 /// Same as [`set_string`] for a boolean field.
 fn set_bool(doc: &mut DocumentMut, section: &str, key: &str, new_value: bool) -> Result<()> {
+    let table = doc
+        .entry(section)
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| AppError::Other(format!("config.toml: [{section}] is not a table")))?;
+
+    if let Some(item) = table.get_mut(key)
+        && let Some(v) = item.as_value_mut()
+    {
+        *v = toml_edit::Value::from(new_value);
+        v.decor_mut().set_prefix(" ");
+        return Ok(());
+    }
+    table.insert(key, value(new_value));
+    Ok(())
+}
+
+/// Same as [`set_string`] for a numeric field (the monthly-limit rows).
+fn set_number(doc: &mut DocumentMut, section: &str, key: &str, new_value: f64) -> Result<()> {
     let table = doc
         .entry(section)
         .or_insert_with(toml_edit::table)
@@ -690,46 +831,105 @@ struct KeyAccountVendor {
 /// `openrouter`'s legacy hand-written labels are gone — the shared
 /// positional rule owns naming for all of these.
 const KEY_ACCOUNT_VENDORS: &[KeyAccountVendor] = &[
-    KeyAccountVendor { id: VendorId::Kimi, display: "Kimi", section: "kimi", env: "KIMI_API_KEY", supports_limit: false, refuse_default_removal: true },
-    KeyAccountVendor { id: VendorId::AnthropicApi, display: "Anthropic API", section: "anthropic_api", env: "ANTHROPIC_ADMIN_KEY", supports_limit: true, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::OpenaiApi, display: "OpenAI API", section: "openai_api", env: "OPENAI_ADMIN_KEY", supports_limit: true, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Openrouter, display: "OpenRouter", section: "openrouter", env: "OPENROUTER_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Deepseek, display: "DeepSeek", section: "deepseek", env: "DEEPSEEK_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Kilo, display: "Kilo", section: "kilo", env: "KILO_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Novita, display: "Novita", section: "novita", env: "NOVITA_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Moonshot, display: "Moonshot", section: "moonshot", env: "MOONSHOT_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Grok, display: "Grok", section: "grok", env: "XAI_MANAGEMENT_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::Minimax, display: "MiniMax", section: "minimax", env: "MINIMAX_API_KEY", supports_limit: false, refuse_default_removal: false },
-    KeyAccountVendor { id: VendorId::OpenCodeGo, display: "OpenCode Go", section: "opencode-go", env: "OPENCODE_GO_API_KEY", supports_limit: false, refuse_default_removal: false },
+    KeyAccountVendor {
+        id: VendorId::Kimi,
+        display: "Kimi",
+        section: "kimi",
+        env: "KIMI_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: true,
+    },
+    KeyAccountVendor {
+        id: VendorId::AnthropicApi,
+        display: "Anthropic API",
+        section: "anthropic_api",
+        env: "ANTHROPIC_ADMIN_KEY",
+        supports_limit: true,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::OpenaiApi,
+        display: "OpenAI API",
+        section: "openai_api",
+        env: "OPENAI_ADMIN_KEY",
+        supports_limit: true,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Openrouter,
+        display: "OpenRouter",
+        section: "openrouter",
+        env: "OPENROUTER_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Deepseek,
+        display: "DeepSeek",
+        section: "deepseek",
+        env: "DEEPSEEK_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Kilo,
+        display: "Kilo",
+        section: "kilo",
+        env: "KILO_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Novita,
+        display: "Novita",
+        section: "novita",
+        env: "NOVITA_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Moonshot,
+        display: "Moonshot",
+        section: "moonshot",
+        env: "MOONSHOT_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Grok,
+        display: "Grok",
+        section: "grok",
+        env: "XAI_MANAGEMENT_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::Minimax,
+        display: "MiniMax",
+        section: "minimax",
+        env: "MINIMAX_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
+    KeyAccountVendor {
+        id: VendorId::OpenCodeGo,
+        display: "OpenCode Go",
+        section: "opencode-go",
+        env: "OPENCODE_GO_API_KEY",
+        supports_limit: false,
+        refuse_default_removal: false,
+    },
 ];
 
 impl KeyAccountVendor {
     /// The section's default inline key, when set.
     fn default_inline_key<'a>(&self, cfg: &'a Config) -> Option<&'a str> {
-        let key = match self.id {
-            VendorId::Kimi => cfg.kimi.api_key.as_deref(),
-            VendorId::Openrouter => cfg.openrouter.api_key.as_deref(),
-            VendorId::Deepseek => cfg.deepseek.api_key.as_deref(),
-            VendorId::Kilo => cfg.kilo.api_key.as_deref(),
-            VendorId::Novita => cfg.novita.api_key.as_deref(),
-            VendorId::Moonshot => cfg.moonshot.api_key.as_deref(),
-            VendorId::Grok => cfg.grok.api_key.as_deref(),
-            VendorId::Minimax => cfg.minimax.api_key.as_deref(),
-            VendorId::OpenCodeGo => cfg.opencode_go.api_key.as_deref(),
-            VendorId::AnthropicApi => cfg.anthropic_api.api_key.as_deref(),
-            VendorId::OpenaiApi => cfg.openai_api.api_key.as_deref(),
-            _ => return None,
-        };
-        key.filter(|k| !k.is_empty())
+        cfg.inline_api_key(self.id).filter(|key| !key.is_empty())
     }
 
     /// The section-level monthly limit (the DEFAULT card's limit).
     fn default_limit(&self, cfg: &Config) -> Option<f64> {
-        match self.id {
-            VendorId::AnthropicApi => cfg.anthropic_api.monthly_limit,
-            VendorId::OpenaiApi => cfg.openai_api.monthly_limit,
-            _ => None,
-        }
+        default_section_limit(cfg, self.id)
     }
 }
 
@@ -890,7 +1090,9 @@ enum AccountMutation {
         fields: BTreeMap<String, String>,
         api_key: Option<AccountKeyMutation>,
     },
-    Remove { label: String },
+    Remove {
+        label: String,
+    },
 }
 
 /// Resolve a settings-account address into a 0-based index into the vendor's
@@ -949,31 +1151,12 @@ enum KeyMutation {
         fields: BTreeMap<String, String>,
     },
     /// Field-only change: no key touched.
-    Fields {
-        fields: BTreeMap<String, String>,
-    },
+    Fields { fields: BTreeMap<String, String> },
 }
 
 const SETTINGS_SCHEMA_VERSION: u8 = 1;
 const MAX_SETTINGS_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
-
-fn configured_key_env<'a>(cfg: &'a Config, section: &str, fallback: &'a str) -> &'a str {
-    match section {
-        "anthropic_api" => &cfg.anthropic_api.api_key_env,
-        "zai" => &cfg.zai.api_key_env,
-        "openrouter" => &cfg.openrouter.api_key_env,
-        "deepseek" => &cfg.deepseek.api_key_env,
-        "kimi" => &cfg.kimi.api_key_env,
-        "kilo" => &cfg.kilo.api_key_env,
-        "novita" => &cfg.novita.api_key_env,
-        "moonshot" => &cfg.moonshot.api_key_env,
-        "grok" => &cfg.grok.api_key_env,
-        "minimax" => &cfg.minimax.api_key_env,
-        "opencode-go" => &cfg.opencode_go.api_key_env,
-        _ => fallback,
-    }
-}
 
 fn snapshot_from_config_with(
     cfg: &Config,
@@ -1004,9 +1187,8 @@ fn snapshot_from_config_with(
         .iter()
         .filter(|vendor| !account_card_vendors.contains(&vendor.id))
         .map(|vendor| {
-            let environment = configured_key_env(cfg, vendor.section, vendor.env);
-            let inline_configured =
-                config_inline_key(cfg, vendor.section).is_some_and(|v| !v.is_empty());
+            let environment = cfg.api_key_env_name(vendor.id).unwrap_or(vendor.env);
+            let inline_configured = cfg.inline_api_key(vendor.id).is_some_and(|v| !v.is_empty());
             let environment_configured = environment_configured(environment);
             KeyStatus {
                 id: vendor.id.slug().to_string(),
@@ -1026,9 +1208,11 @@ fn snapshot_from_config_with(
         keys,
         accounts: zai_account_status(cfg, &environment_configured)
             .into_iter()
-            .chain(KEY_ACCOUNT_VENDORS.iter().flat_map(|spec| {
-                key_account_cards(spec, cfg, &environment_configured)
-            }))
+            .chain(
+                KEY_ACCOUNT_VENDORS
+                    .iter()
+                    .flat_map(|spec| key_account_cards(spec, cfg, &environment_configured)),
+            )
             .collect(),
     }
 }
@@ -1039,7 +1223,13 @@ fn snapshot_from_config_with(
 /// No name field: the bar tags accounts with the provider logo now, so
 /// accounts are named where they are created — adds auto-name server-side
 /// (`auto_account_label`), and a rename stays a config.toml edit.
-fn zai_account_fields(label: &str, kind: ZaiAccountType, _site: &str, org: &str, proj: &str) -> Vec<FieldStatus> {
+fn zai_account_fields(
+    label: &str,
+    kind: ZaiAccountType,
+    _site: &str,
+    org: &str,
+    proj: &str,
+) -> Vec<FieldStatus> {
     let _ = label;
     let mut fields = Vec::new();
     // NOTE: no site field anymore — the site (z.ai / bigmodel.cn) is
@@ -1096,28 +1286,30 @@ fn zai_account_status(
     let default_inline = cfg.zai.api_key.as_deref().is_some_and(|v| !v.is_empty());
     let default_configured = default_inline || env_configured;
     let mut out = Vec::new();
-    if default_configured {
+    // Same empty-state rule as key_account_cards: with no key AND no
+    // numbered accounts the default row is still emitted — it is the
+    // settings form's Add-button anchor for the vendor group.
+    if default_configured || cfg.zai.accounts.is_empty() {
         out.push(AccountStatus {
-        vendor: "zai",
-        vendor_display: "Z.AI".into(),
-        label: String::new(),
-        display: "Default".into(),
-        environment: env.clone(),
-        configured: cfg.zai.api_key.as_deref().is_some_and(|v| !v.is_empty())
-            || env_configured,
-        inline_configured: cfg.zai.api_key.as_deref().is_some_and(|v| !v.is_empty()),
-        environment_configured: env_configured,
-        fields: zai_account_fields(
-            "",
-            cfg.zai.account_type,
-            &match cfg.zai.site {
-                Some(crate::config::ZaiSite::Global) => "global".to_string(),
-                Some(crate::config::ZaiSite::Cn) => "cn".to_string(),
-                None => String::new(),
-            },
-            cfg.zai.organization_id.as_deref().unwrap_or(""),
-            cfg.zai.project_id.as_deref().unwrap_or(""),
-        ),
+            vendor: "zai",
+            vendor_display: "Z.AI".into(),
+            label: String::new(),
+            display: "Default".into(),
+            environment: env.clone(),
+            configured: cfg.zai.api_key.as_deref().is_some_and(|v| !v.is_empty()) || env_configured,
+            inline_configured: cfg.zai.api_key.as_deref().is_some_and(|v| !v.is_empty()),
+            environment_configured: env_configured,
+            fields: zai_account_fields(
+                "",
+                cfg.zai.account_type,
+                &match cfg.zai.site {
+                    Some(crate::config::ZaiSite::Global) => "global".to_string(),
+                    Some(crate::config::ZaiSite::Cn) => "cn".to_string(),
+                    None => String::new(),
+                },
+                cfg.zai.organization_id.as_deref().unwrap_or(""),
+                cfg.zai.project_id.as_deref().unwrap_or(""),
+            ),
         });
     }
     for account in &cfg.zai.accounts {
@@ -1238,15 +1430,49 @@ fn state_from_apply_request(cfg: &Config, raw: &str) -> Result<SettingsState> {
         input.revealed = false;
 
         if !fields.is_empty() {
-            if id != "zai" {
+            if id == "zai" {
+                apply_zai_fields(&mut state.zai, &fields)?;
+            } else if let Some(kv) = KEY_VENDORS.get(index)
+                && kv.monthly_limit
+            {
+                apply_default_limit_field(kv.label, &mut state.limits[index], &fields)?;
+            } else {
                 return Err(AppError::Other(format!(
                     "vendor {id:?} has no editable fields"
                 )));
             }
-            apply_zai_fields(&mut state.zai, &fields)?;
         }
     }
     Ok(state)
+}
+
+/// The overlay's one non-key field: the DEFAULT section's `monthly_limit`
+/// for the Admin-spend vendors. Unknown fields are refused; blank removes
+/// the limit; the numeric check runs here so a bad patch never saves.
+fn apply_default_limit_field(
+    label: &str,
+    input: &mut KeyInput,
+    fields: &BTreeMap<String, String>,
+) -> Result<()> {
+    for field in fields.keys() {
+        if field != "monthly_limit" {
+            return Err(AppError::Other(format!(
+                "{label} has no field {field:?} — the overlay edits the API key and the \
+                 default-section monthly_limit; per-account limits are a config.toml edit"
+            )));
+        }
+    }
+    let Some(raw) = fields.get("monthly_limit") else {
+        return Ok(());
+    };
+    match parse_monthly_limit(label, raw)? {
+        Some(value) => input.buf = format!("{value}"),
+        None => input.buf.clear(),
+    }
+    input.cursor = input.buf.chars().count();
+    input.dirty = true;
+    input.revealed = true;
+    Ok(())
 }
 
 /// Validate and apply a field patch onto the Z.AI fields. `team` without both
@@ -1404,7 +1630,11 @@ fn validate_account_key(value: &str) -> Result<()> {
 /// Writing rules mirror the config's own conventions: values equal to the
 /// default are removed rather than spelled out, and non-team accounts never
 /// keep organization ids around.
-fn apply_account_mutations_to_path(cfg: &Config, request: &ApplyRequest, path: &Path) -> Result<()> {
+fn apply_account_mutations_to_path(
+    cfg: &Config,
+    request: &ApplyRequest,
+    path: &Path,
+) -> Result<()> {
     for vendor in request.accounts.keys() {
         if vendor != "zai"
             && !KEY_ACCOUNT_VENDORS
@@ -1462,7 +1692,11 @@ fn apply_account_mutations_to_path(cfg: &Config, request: &ApplyRequest, path: &
     Ok(())
 }
 
-fn apply_zai_mutations(doc: &mut DocumentMut, cfg: &Config, mutations: &[AccountMutation]) -> Result<()> {
+fn apply_zai_mutations(
+    doc: &mut DocumentMut,
+    cfg: &Config,
+    mutations: &[AccountMutation],
+) -> Result<()> {
     // Accounts are addressed by position; `live_count` follows every add and
     // remove in this request, in order, so a sequence like remove-2 + add
     // composes exactly as the panel previewed it.
@@ -1497,9 +1731,7 @@ fn apply_zai_mutations(doc: &mut DocumentMut, cfg: &Config, mutations: &[Account
                 }
             }
             AccountMutation::Add {
-                fields,
-                api_key,
-                ..
+                fields, api_key, ..
             } => {
                 let parsed = AccountFields::parse(fields)?;
                 // No label written: the entry's name is its position, derived
@@ -1532,7 +1764,13 @@ fn apply_zai_mutations(doc: &mut DocumentMut, cfg: &Config, mutations: &[Account
                         .ok_or_else(|| {
                             AppError::Other("config.toml: [zai] is not a table".into())
                         })?;
-                    for key in ["api_key", "account_type", "site", "organization_id", "project_id"] {
+                    for key in [
+                        "api_key",
+                        "account_type",
+                        "site",
+                        "organization_id",
+                        "project_id",
+                    ] {
                         table.remove(key);
                     }
                 } else {
@@ -1590,9 +1828,7 @@ fn apply_key_account_mutations(
                 }
             }
             AccountMutation::Add {
-                fields,
-                api_key,
-                ..
+                fields, api_key, ..
             } => {
                 let limit = parse_limit_field(spec, fields)?;
                 // No label written: the entry's name is its position,
@@ -1673,24 +1909,7 @@ fn parse_limit_field(
             spec.display
         )));
     }
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(Some(None));
-    }
-    let value: f64 = trimmed.parse().map_err(|_| {
-        AppError::Other(format!(
-            "{} monthly_limit {trimmed:?} is not a number",
-            spec.display
-        ))
-    })?;
-    if !value.is_finite() || value <= 0.0 {
-        return Err(AppError::Other(format!(
-            "{} monthly_limit must be finite and greater than zero; clear the field to \
-             show spend without a limit",
-            spec.display
-        )));
-    }
-    Ok(Some(Some(value)))
+    parse_monthly_limit(spec.display, raw).map(Some)
 }
 
 fn apply_limit_to_table(table: &mut toml_edit::Table, limit: Option<Option<f64>>) -> Result<()> {
@@ -1754,10 +1973,11 @@ fn write_account_fields(table: &mut toml_edit::Table, parsed: &AccountFields) ->
             set_string_in(table, "account_type", kind)?;
         }
     }
-    let keep_ids = matches!(
-        parsed.account_type.as_deref(),
-        Some("team") | None
-    ) && !matches!(parsed.account_type.as_deref(), Some("personal") | Some("usage"));
+    let keep_ids = matches!(parsed.account_type.as_deref(), Some("team") | None)
+        && !matches!(
+            parsed.account_type.as_deref(),
+            Some("personal") | Some("usage")
+        );
     for (key, value) in [
         ("organization_id", &parsed.organization_id),
         ("project_id", &parsed.project_id),
@@ -1879,7 +2099,8 @@ fn read_settings_request<R: BufRead>(reader: R) -> Result<String> {
 fn apply_settings_from_stdin() -> Result<()> {
     let raw = read_settings_request(std::io::stdin().lock())?;
     let cfg = Config::load()?;
-    let logged = crate::diag::redact(&serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default());
+    let logged =
+        crate::diag::redact(&serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default());
     let result = (|| -> Result<()> {
         let state = state_from_apply_request(&cfg, &raw)?;
         save_to_config_default(&state)?;
@@ -1890,10 +2111,7 @@ fn apply_settings_from_stdin() -> Result<()> {
         Ok(())
     })();
     match &result {
-        Ok(()) => crate::diag::event(
-            "settings/apply",
-            &format!("ok request={logged}"),
-        ),
+        Ok(()) => crate::diag::event("settings/apply", &format!("ok request={logged}")),
         Err(e) => crate::diag::event(
             "settings/apply",
             &format!("error: {} request={logged}", e.user_message()),
@@ -1955,6 +2173,13 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
     for (i, kv) in KEY_VENDORS.iter().enumerate() {
         let focused = state.focus == Focus::Key(i);
         lines.push(key_row(kv, &state.keys[i], focused, &bubble));
+        if kv.monthly_limit {
+            lines.push(limit_row(
+                &state.limits[i],
+                state.focus == Focus::Limit(i),
+                &bubble,
+            ));
+        }
     }
     lines.push(Line::from(""));
 
@@ -1963,7 +2188,13 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
     if !state.status.is_empty() {
         let ok = state.status.starts_with("saved");
         let mark = if ok { "  ✓ " } else { "  ✗ " };
-        let style = if ok { bubble.accent } else { bubble.selected };
+        // A failed save is the overlay's only alarm: use the theme's critical
+        // color. bubble.selected is the focus highlight, not an error signal.
+        let style = if ok {
+            bubble.accent
+        } else {
+            Style::default().fg(color(&theme.red).unwrap_or(bubble.palette.error))
+        };
         lines.push(Line::from(vec![
             Span::styled(mark, style.add_modifier(Modifier::BOLD)),
             Span::styled(state.status.clone(), bubble.muted),
@@ -1984,6 +2215,12 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
             ("↑↓/tab", "move"),
             ("type", "edit key"),
             ("^V", "reveal"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::Limit(_) => bubble.help_line([
+            ("↑↓/tab", "move"),
+            ("type", "edit limit"),
             ("^S", "save"),
             ("esc", "close"),
         ]),
@@ -2072,6 +2309,34 @@ fn key_row(kv: &KeyVendor, input: &KeyInput, focused: bool, theme: &BubbleTheme)
     }
 }
 
+/// The `monthly_limit` sub-row under an Admin-spend vendor's key row: plain
+/// text, USD per month, editing the DEFAULT section only. The hint states
+/// where per-account limits live instead (config.toml / Omarchy form).
+fn limit_row(input: &KeyInput, focused: bool, theme: &BubbleTheme) -> Line<'static> {
+    let label = format!("{:<11}", "↳ limit/mo");
+    let value = value_text(input, focused);
+    let suffix = "   USD/month · per-account limits: config.toml / Omarchy form";
+    if focused {
+        Line::from(vec![
+            theme.span("  "),
+            Span::styled("▸ ", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled(label, theme.title.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {value} "),
+                theme.selected.add_modifier(Modifier::REVERSED),
+            ),
+            theme.muted(suffix),
+        ])
+    } else {
+        Line::from(vec![
+            theme.span("    "),
+            Span::styled(label, theme.text),
+            Span::styled(format!(" {value}"), theme.text),
+            theme.muted(suffix),
+        ])
+    }
+}
+
 /// The value column: `(empty)` / a cursor when focused-empty / masked or
 /// revealed buffer with a cursor mark inserted when focused.
 fn value_text(input: &KeyInput, focused: bool) -> String {
@@ -2155,12 +2420,14 @@ mod tests {
             .iter()
             .map(|f| f["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["api_key"],
-            "no name and no region field — accounts auto-name on add, region is auto-detected");
+        assert_eq!(
+            ids,
+            vec!["api_key"],
+            "no name and no region field — accounts auto-name on add, region is auto-detected"
+        );
 
         // An unconfigured kimi shows no default card at all.
-        let bare = settings_snapshot_json_with(&Config::default(), |_| false)
-            .unwrap();
+        let bare = settings_snapshot_json_with(&Config::default(), |_| false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&bare).unwrap();
         // The empty state: kimi's ONLY card is the default one (its Add
         // button), with no numbered cards until a key is added.
@@ -2180,9 +2447,14 @@ mod tests {
             {"action":"add","api_key":{"action":"set","value":"k"}}]}}"#;
         apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
         let reloaded = Config::load_from(&path).unwrap();
-        assert!(reloaded.kimi.enabled, "key through the form opts the vendor in");
-        assert!(reloaded.kimi.accounts.iter().any(|a| a.label == "1"),
-            "the first account is named by its position");
+        assert!(
+            reloaded.kimi.enabled,
+            "key through the form opts the vendor in"
+        );
+        assert!(
+            reloaded.kimi.accounts.iter().any(|a| a.label == "1"),
+            "the first account is named by its position"
+        );
 
         // Any field (name included) is rejected — position is the identity,
         // region is auto-detected.
@@ -2233,8 +2505,7 @@ mod tests {
             "zai":[{"action":"add"}]}}"#;
         apply_settings_json_to_path(&cfg, patch, &path).unwrap();
         let cfg = Config::load_from(&path).unwrap();
-        let kimi_labels: Vec<&str> =
-            cfg.kimi.accounts.iter().map(|a| a.label.as_str()).collect();
+        let kimi_labels: Vec<&str> = cfg.kimi.accounts.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(kimi_labels, vec!["1", "2", "3"], "{kimi_labels:?}");
         let zai_labels: Vec<&str> = cfg.zai.accounts.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(zai_labels, vec!["1", "2"], "{zai_labels:?}");
@@ -2268,9 +2539,17 @@ mod tests {
                 {"action":"add","api_key":{"action":"set","value":"d2"}}]}}"#;
         apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
         let cfg = Config::load_from(&path).unwrap();
-        let labels: Vec<&str> = cfg.deepseek.accounts.iter().map(|a| a.label.as_str()).collect();
+        let labels: Vec<&str> = cfg
+            .deepseek
+            .accounts
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
         assert_eq!(labels, vec!["1", "2"]);
-        assert!(cfg.deepseek.enabled, "a key through the form opts the vendor in");
+        assert!(
+            cfg.deepseek.enabled,
+            "a key through the form opts the vendor in"
+        );
         // A limit on a non-spend vendor is refused.
         let bad = r#"{"schema_version":1,"accounts":{"deepseek":[
             {"action":"add","fields":{"monthly_limit":"100"}}]}}"#;
@@ -2321,16 +2600,107 @@ mod tests {
             "deepseek":[{"action":"remove","label":"1"}]}}"#;
         apply_settings_json_to_path(&cfg, patch, &path).unwrap();
         let cfg = Config::load_from(&path).unwrap();
-        let labels: Vec<&str> = cfg.deepseek.accounts.iter().map(|a| a.label.as_str()).collect();
+        let labels: Vec<&str> = cfg
+            .deepseek
+            .accounts
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
         assert_eq!(labels, vec!["1"]);
         assert_eq!(cfg.deepseek.accounts[0].api_key.as_deref(), Some("d2"));
+    }
+
+    /// Overlay parity with the Omarchy form: the `s` overlay saves the OpenAI
+    /// API Admin key exactly like the form's card — `[openai_api] api_key`
+    /// plus the `enabled = true` opt-in.
+    #[test]
+    fn openai_api_key_saves_through_the_overlay_patch() {
+        let (_td, path) = temp_config(None);
+        let patch = r#"{"schema_version":1,"keys":{"openai_api":{"action":"set","value":"sk-admin-openai"}}}"#;
+        apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[openai_api]"), "{raw}");
+        assert!(raw.contains("api_key = \"sk-admin-openai\""), "{raw}");
+        assert!(raw.contains("enabled = true"), "{raw}");
+        let reloaded = Config::load_from(&path).unwrap();
+        assert!(reloaded.openai_api.enabled);
+        assert_eq!(
+            reloaded.openai_api.api_key.as_deref(),
+            Some("sk-admin-openai")
+        );
+    }
+
+    /// The overlay's one numeric row: the DEFAULT section's `monthly_limit`
+    /// for the two Admin-spend vendors. Setting writes the number via the
+    /// toml_edit round-trip, clearing removes the key, and a fields-only
+    /// patch never flips `enabled`. Account-level limits are NOT reachable
+    /// from the overlay — that stays config-file/Omarchy-form territory.
+    #[test]
+    fn default_monthly_limit_set_and_clear_round_trip() {
+        let (_td, path) = temp_config(Some("# spend cap\n[anthropic_api]\n# kept comment\n"));
+        let patch = r#"{"schema_version":1,"keys":{"anthropic_api":{"action":"fields","fields":{"monthly_limit":"250"}}}}"#;
+        apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("monthly_limit = 250"), "{raw}");
+        assert!(raw.contains("# kept comment"), "comments survive: {raw}");
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.anthropic_api.monthly_limit, Some(250.0));
+        assert!(
+            !cfg.anthropic_api.enabled,
+            "a limit alone never opts the vendor in"
+        );
+
+        // OpenAI API's default limit rides the same row type.
+        let patch = r#"{"schema_version":1,"keys":{"openai_api":{"action":"fields","fields":{"monthly_limit":"40"}}}}"#;
+        apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.openai_api.monthly_limit, Some(40.0));
+
+        // Blank = no limit: the key is removed from the file (only the
+        // anthropic one — openai_api's untouched limit survives).
+        let patch = r#"{"schema_version":1,"keys":{"anthropic_api":{"action":"fields","fields":{"monthly_limit":""}}}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("250"), "{raw}");
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.anthropic_api.monthly_limit, None);
+        // The untouched openai_api limit survives the round-trip.
+        assert_eq!(reloaded.openai_api.monthly_limit, Some(40.0));
+    }
+
+    /// Malformed limit input is rejected with a message naming the problem,
+    /// and NOTHING is written — the file keeps its previous bytes.
+    #[test]
+    fn invalid_monthly_limit_input_is_rejected_with_a_message() {
+        let start = "[anthropic_api]\nmonthly_limit = 10\n";
+        for (raw, fragment) in [
+            ("abc", "not a number"),
+            ("12abc", "not a number"),
+            ("-5", "greater than zero"),
+            ("0", "greater than zero"),
+            ("inf", "greater than zero"),
+            ("NaN", "greater than zero"),
+            ("1e309", "greater than zero"),
+        ] {
+            let patch = format!(
+                r#"{{"schema_version":1,"keys":{{"anthropic_api":{{"action":"fields","fields":{{"monthly_limit":"{raw}"}}}}}}}}"#
+            );
+            let (_td, path) = temp_config(Some(start));
+            let error = apply_settings_json_to_path(&Config::default(), &patch, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(fragment), "input {raw:?}: {error}");
+            // Rejected input never reaches the file.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), start);
+        }
     }
 
     /// A config written by an older version (labels in `[[zai.accounts]]`)
     /// loads with positional names — the stored labels are ignored, and the
     /// settings bridge drops them the moment it touches an entry.
     #[test]
-    fn legacy_labels_are_ignored_and_stripped_on_touch() {        let (_td, path) = temp_config(Some(
+    fn legacy_labels_are_ignored_and_stripped_on_touch() {
+        let (_td, path) = temp_config(Some(
             "[[zai.accounts]]\nlabel = \"work\"\napi_key = \"k1\"\n\n\
              [[zai.accounts]]\nlabel = \"team\"\napi_key = \"k2\"\n",
         ));
@@ -2342,7 +2712,10 @@ mod tests {
             {"action":"update","label":"1","api_key":{"action":"clear"}}]}}"#;
         apply_settings_json_to_path(&cfg, patch, &path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("label"), "touched entry lost its stale label: {raw}");
+        assert!(
+            !raw.contains("label"),
+            "touched entry lost its stale label: {raw}"
+        );
         let reloaded = Config::load_from(&path).unwrap();
         assert_eq!(reloaded.zai.accounts[0].api_key, None);
         assert_eq!(reloaded.zai.accounts[1].api_key.as_deref(), Some("k2"));
@@ -2374,15 +2747,21 @@ mod tests {
         assert_eq!(accounts[0]["label"], "");
         // Named accounts carry the name field first and the API key last.
         let named = &accounts[1];
-        assert_eq!(named["label"], "1", "the panel sees the derived positional name");
+        assert_eq!(
+            named["label"], "1",
+            "the panel sees the derived positional name"
+        );
         let ids: Vec<&str> = named["fields"]
             .as_array()
             .unwrap()
             .iter()
             .map(|f| f["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["account_type", "api_key"],
-            "no name field — the position is the name");
+        assert_eq!(
+            ids,
+            vec!["account_type", "api_key"],
+            "no name field — the position is the name"
+        );
 
         let (_td, path) = temp_config(None);
         // Apply writes mutations, not snapshots: start from a config whose
@@ -2399,14 +2778,22 @@ mod tests {
              "api_key":{"action":"set","value":"old-key"}}]}}"#;
         apply_settings_json_to_path(&apply_cfg, patch, &path).unwrap();
         let reloaded = Config::load_from(&path).unwrap();
-        let labels: Vec<&str> = reloaded.zai.accounts.iter().map(|a| a.label.as_str()).collect();
+        let labels: Vec<&str> = reloaded
+            .zai
+            .accounts
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
         assert_eq!(labels, vec!["1", "2"]);
         let team = &reloaded.zai.accounts[0];
         assert_eq!(team.account_type, crate::config::ZaiAccountType::Team);
         assert_eq!(team.site, Some(crate::config::ZaiSite::Cn));
         assert_eq!(team.organization_id.as_deref(), Some("org-1"));
         assert_eq!(team.api_key.as_deref(), Some("team-key"));
-        assert!(reloaded.zai.enabled, "a key through the form opts the vendor in");
+        assert!(
+            reloaded.zai.enabled,
+            "a key through the form opts the vendor in"
+        );
 
         // Switch account 1 to usage by position: ids disappear, defaults by
         // removal, and the label stays "1".
@@ -2436,7 +2823,28 @@ mod tests {
             .filter(|a| a["vendor"] == "zai")
             .map(|a| a["label"].as_str().unwrap())
             .collect();
-        assert_eq!(zai_labels, vec!["1", "2"], "no zai default row: {zai_labels:?}");
+        assert_eq!(
+            zai_labels,
+            vec!["1", "2"],
+            "no zai default row: {zai_labels:?}"
+        );
+
+        // A COMPLETELY unconfigured zai keeps one card — its default row is
+        // the group's Add-button anchor, exactly like every other
+        // key-account vendor (kimi's empty state). Without it the settings
+        // form renders no Z.AI group at all and the account cannot be
+        // created from the UI.
+        let raw = settings_snapshot_json_with(&Config::default(), |_| false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let zai_labels: Vec<&str> = parsed["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["vendor"] == "zai")
+            .map(|a| a["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(zai_labels, vec![""], "the empty state is the Add button");
+        assert_eq!(parsed["accounts"].as_array().unwrap()[0]["vendor"], "zai");
 
         // Remove + re-add in ONE save works: positions follow the mutations
         // in order (add → 1, remove 1, add → 1 again).
@@ -2469,7 +2877,10 @@ mod tests {
         apply_settings_json_to_path(&with_default, patch, &path2).unwrap();
         let reset = Config::load_from(&path2).unwrap();
         assert_eq!(reset.zai.api_key, None);
-        assert_eq!(reset.zai.account_type, crate::config::ZaiAccountType::Personal);
+        assert_eq!(
+            reset.zai.account_type,
+            crate::config::ZaiAccountType::Personal
+        );
         assert_eq!(reset.zai.organization_id, None);
 
         // Update the default section's fields, clear the old account, remove it.
@@ -2481,7 +2892,10 @@ mod tests {
             {"action":"remove","label":"2"}]}}"#;
         apply_settings_json_to_path(&reloaded, patch, &path).unwrap();
         let reloaded = Config::load_from(&path).unwrap();
-        assert_eq!(reloaded.zai.account_type, crate::config::ZaiAccountType::Team);
+        assert_eq!(
+            reloaded.zai.account_type,
+            crate::config::ZaiAccountType::Team
+        );
         assert_eq!(reloaded.zai.organization_id.as_deref(), Some("d-org"));
         assert_eq!(reloaded.zai.accounts.len(), 1);
     }
@@ -2519,6 +2933,7 @@ mod tests {
             primary_choices: VendorId::all().to_vec(),
             primary,
             keys: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
+            limits: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
             zai: ZaiFields::default(),
             status: String::new(),
         }
@@ -2536,23 +2951,56 @@ mod tests {
 
     #[test]
     fn focus_cycles_through_primary_all_keys_and_save() {
+        let limit_rows = KEY_VENDORS.iter().filter(|kv| kv.monthly_limit).count();
+        let fields = KEY_VENDORS.len() + limit_rows;
         let mut f = Focus::Primary;
         let mut seen = vec![f];
-        // Full cycle = Primary + N key rows + Save.
-        for _ in 0..(KEY_VENDORS.len() + 2) {
+        // Full cycle = Primary + one focus per field row + Save.
+        for _ in 0..(fields + 2) {
             f = f.next();
             seen.push(f);
         }
-        // Primary, Key(0..n), Save, back to Primary.
+        // Primary, Key/Limit rows, Save, back to Primary.
         assert_eq!(seen.first(), Some(&Focus::Primary));
         assert_eq!(seen.last(), Some(&Focus::Primary));
         assert!(seen.contains(&Focus::Key(0)));
         assert!(seen.contains(&Focus::Key(KEY_VENDORS.len() - 1)));
         assert!(seen.contains(&Focus::Save));
+        // The two spend vendors' limit rows sit right under their key rows.
+        assert!(seen.contains(&Focus::Limit(key_index(VendorId::AnthropicApi))));
+        assert!(seen.contains(&Focus::Limit(key_index(VendorId::OpenaiApi))));
+        assert_eq!(
+            Focus::Key(key_index(VendorId::AnthropicApi)).next(),
+            Focus::Limit(key_index(VendorId::AnthropicApi))
+        );
+        assert_eq!(
+            Focus::Limit(key_index(VendorId::AnthropicApi)).next(),
+            Focus::Key(key_index(VendorId::OpenaiApi))
+        );
+        assert_eq!(Focus::Limit(0).prev(), Focus::Key(0));
         // prev() is the inverse of next().
         assert_eq!(Focus::Primary.next().prev(), Focus::Primary);
         assert_eq!(Focus::Save.prev().next(), Focus::Save);
         assert_eq!(Focus::Primary.prev(), Focus::Save);
+    }
+
+    #[test]
+    fn typing_edits_the_focused_limit_row_only() {
+        let mut s = blank_state(VendorId::Anthropic);
+        let ai = key_index(VendorId::AnthropicApi);
+        s.focus = Focus::Limit(ai);
+        for c in "250".chars() {
+            handle_key(&mut s, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(s.limits[ai].buf, "250");
+        assert!(s.limits[ai].dirty);
+        // The key field above it was not touched.
+        assert!(s.keys[ai].buf.is_empty());
+        // Saving writes the default-section limit.
+        let (_dir, path) = temp_config(None);
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("monthly_limit = 250"), "{raw}");
     }
 
     #[test]

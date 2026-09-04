@@ -7,8 +7,17 @@ these are invariants we keep almost-forgetting, not a project tour.
 
 When cutting a new version (patch, minor, or major):
 
+**`make release-bump V=X.Y.Z`** performs steps 1/3/4/5 mechanically
+(`scripts/release-bump.sh`: six version locations + the `[Unreleased]`
+compare link). It aborts on a dirty tree, never commits/tags/pushes, and
+ends with `make release-check` — which stays red until step 2's CHANGELOG
+section exists, by design. The manual steps below remain the fallback
+documentation.
+
 1. **Bump both versions** — `Cargo.toml` `version` and the root Omarchy
    `manifest.json` `version` must match the release tag.
+   Automated: `make release-bump V=X.Y.Z` (also does steps 3–5 below);
+   the manual edits remain the fallback.
 2. **Update `CHANGELOG.md`**:
    - Add a new `## [X.Y.Z] — YYYY-MM-DD` section above the previous one.
    - Categorize entries by **Added / Changed / Fixed / Security** (Keep-A-Changelog).
@@ -29,6 +38,8 @@ When cutting a new version (patch, minor, or major):
 3. **Bump `packaging/aur/PKGBUILD`** — `pkgver=X.Y.Z`, `pkgrel=1`, reset `sha256sums` to `'SKIP'`.
 4. **Bump `packaging/aur/PKGBUILD-bin`** — same `pkgver`, `pkgrel=1`, reset both
    `sha256sums_x86_64` and `sha256sums_aarch64` to `'SKIP'`.
+   (Steps 3–4 are part of `make release-bump V=X.Y.Z`; manual edits are the
+   fallback.)
 5. **Regenerate both `.SRCINFO`s NOW, before tagging** — the release
    workflow's `verify-version` job rejects the tag if `packaging/aur/.SRCINFO`
    or `.SRCINFO-bin` still carry the old `pkgver` (learned at v0.17.0, which
@@ -41,12 +52,16 @@ When cutting a new version (patch, minor, or major):
      cp "$t/.SRCINFO-bin" .SRCINFO-bin && rm -rf "$t"
    ```
    The committed files keep `sha256sums = SKIP`; CI pins the real hashes later.
+   `make release-bump V=X.Y.Z` seds the `pkgver` lines portably, but this
+   `makepkg --printsrcinfo` procedure stays the AUTHORITATIVE regeneration
+   path on Arch — run it when one is available.
 6. **Run gate before tagging**:
    ```
    make test                                   # cargo test + the desktop JS gate
    cargo clippy --all-targets -- -D warnings   # clean
    cargo machete                               # no unused deps
    omarchy plugin validate .                   # plugin manifest + entry points
+   make release-check                          # six versions agree + CHANGELOG section (release.yml's verify-version, pre-tag)
    ```
    `make test` rather than `cargo test`: it also runs the GNOME, KDE, and
    Omarchy frontend contract suites. If `kde-plasmoid/` changed, also bump

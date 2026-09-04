@@ -57,18 +57,52 @@
 //! - **SuperGrok**: asks the official Grok Build CLI's `x.ai/billing` ACP
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
+//!   `supergrok_live` skips when that CLI is not installed.
+//! - **DeepSeek**: `/user/balance` returns an availability flag, a currency
+//!   label, and a non-negative balance split into granted / topped-up
+//!   components. `deepseek_live` skips when `DEEPSEEK_API_KEY` is unset.
+//! - **Kilo**: `/api/profile/balance` returns a non-negative USD credit
+//!   balance. `kilo_live` skips when `KILO_API_KEY` is unset.
+//! - **Novita**: the billing balance detail returns non-negative available /
+//!   cash / credit-limit / outstanding amounts. `novita_live` skips when
+//!   `NOVITA_API_KEY` is unset.
+//! - **Moonshot**: `/v1/users/me/balance` returns a non-negative spendable
+//!   balance; the region picks host and currency (`MOONSHOT_REGION=cn` for
+//!   CNY, default global/USD). `moonshot_live` skips when `MOONSHOT_API_KEY`
+//!   is unset.
+//! - **Grok**: the Management API returns a finite prepaid balance, with the
+//!   team auto-resolved from the key unless `XAI_TEAM_ID` is set.
+//!   `grok_live` skips when `XAI_MANAGEMENT_KEY` is unset.
+//! - **OpenCode Go**: the official usage endpoint yields at least one of the
+//!   rolling / weekly / monthly windows, each percent-bounded. `opencode_go_live`
+//!   skips when `OPENCODE_GO_API_KEY` is unset.
+//! - **Anthropic API**: the Admin cost report returns a finite non-negative
+//!   month-to-date spend. `anthropic_api_live` skips when
+//!   `ANTHROPIC_ADMIN_KEY` is unset.
+//! - **Antigravity**: probes the loopback language servers that the local
+//!   Antigravity products expose, then asserts the plan label and bounded
+//!   window percentages. `antigravity_live` skips when loopback discovery
+//!   finds nothing listening.
 
 use std::time::Duration;
 
 use ai_usagebar::anthropic;
+use ai_usagebar::anthropic_api;
+use ai_usagebar::antigravity;
 use ai_usagebar::cache::Cache;
 use ai_usagebar::cursor;
+use ai_usagebar::deepseek;
 use ai_usagebar::error::AppError;
+use ai_usagebar::grok;
+use ai_usagebar::kilo;
 use ai_usagebar::kimi;
 use ai_usagebar::kiro;
 use ai_usagebar::minimax;
+use ai_usagebar::moonshot;
+use ai_usagebar::novita;
 use ai_usagebar::openai;
 use ai_usagebar::openai_api;
+use ai_usagebar::opencode_go;
 use ai_usagebar::openrouter;
 use ai_usagebar::supergrok;
 use ai_usagebar::zai;
@@ -102,7 +136,13 @@ async fn anthropic_live() {
     let creds_target = anthropic::creds::CredsTarget::Default(creds_path);
     match anthropic::creds::resolve(&creds_target) {
         Ok(_) => {}
-        Err(err) if is_missing_credentials(&err) => {
+        // A missing file (no Keychain on Linux) surfaces as `Unconfigured`
+        // with "credentials error:" Display prose, not a bare io::NotFound —
+        // treat both as the documented no-creds skip.
+        Err(err)
+            if is_missing_credentials(&err)
+                || matches!(err, AppError::Unconfigured(_) | AppError::Credentials(_)) =>
+        {
             eprintln!("anthropic_live: no Claude credentials (file or Keychain) — skipping");
             return;
         }
@@ -154,11 +194,13 @@ async fn anthropic_live() {
 #[ignore = "live API; run with --ignored"]
 async fn openai_live() {
     let creds_path = openai::creds::default_path().expect("resolve home directory");
-    assert!(
-        creds_path.exists(),
-        "no Codex credentials at {} — log in with `codex login` first",
-        creds_path.display()
-    );
+    if !creds_path.exists() {
+        eprintln!(
+            "openai_live: no Codex credentials at {} — skipping (run `codex login` first)",
+            creds_path.display()
+        );
+        return;
+    }
     let cache = xdg_cache_for("openai");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -204,8 +246,14 @@ async fn openai_live() {
 #[tokio::test]
 #[ignore = "live API; run with --ignored"]
 async fn zai_live() {
-    let api_key = std::env::var("ZAI_API_KEY")
-        .expect("ZAI_API_KEY must be set (source ~/.config/zsh/secrets)");
+    let Ok(api_key) = std::env::var("ZAI_API_KEY") else {
+        eprintln!("zai_live: ZAI_API_KEY is unset — skipping optional Z.AI smoke test");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("zai_live: ZAI_API_KEY is empty — skipping optional Z.AI smoke test");
+        return;
+    }
     let cache = xdg_cache_for("zai");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -344,8 +392,18 @@ async fn zai_usage_only_live() {
 #[tokio::test]
 #[ignore = "live API; run with --ignored"]
 async fn openrouter_live() {
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .expect("OPENROUTER_API_KEY must be set (source ~/.config/zsh/secrets)");
+    let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") else {
+        eprintln!(
+            "openrouter_live: OPENROUTER_API_KEY is unset — skipping optional OpenRouter smoke test"
+        );
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!(
+            "openrouter_live: OPENROUTER_API_KEY is empty — skipping optional OpenRouter smoke test"
+        );
+        return;
+    }
     let cache = xdg_cache_for("openrouter");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -629,9 +687,17 @@ async fn supergrok_live() {
     )
     .expect("resolve Grok scope paths");
     let cache = xdg_cache_for("supergrok");
-    let out = supergrok::fetch_snapshot(&binary, &scope_paths, &cache, Duration::ZERO)
-        .await
-        .expect("SuperGrok billing should succeed through official Grok Build ACP");
+    // A missing Grok Build install is the unconfigured state for this vendor.
+    let fetched = supergrok::fetch_snapshot(&binary, &scope_paths, &cache, Duration::ZERO).await;
+    let out = match fetched {
+        Err(AppError::Credentials(msg)) if msg.contains("Grok Build CLI not found") => {
+            eprintln!(
+                "supergrok_live: official Grok Build CLI not found — skipping (install Grok Build, run `grok login`, or set SUPERGROK_GROK_BINARY)"
+            );
+            return;
+        }
+        other => other.expect("SuperGrok billing should succeed through official Grok Build ACP"),
+    };
 
     assert!(
         out.snapshot.weekly_pct >= 0,
@@ -754,5 +820,396 @@ async fn openai_api_live() {
         out.snapshot.spent,
         out.snapshot.by_day.len(),
         out.snapshot.top_items.first()
+    );
+}
+
+// --- Opt-in vendors: each skips gracefully when unconfigured ----------------
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn deepseek_live() {
+    let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") else {
+        eprintln!(
+            "deepseek_live: DEEPSEEK_API_KEY is unset — skipping optional DeepSeek smoke test"
+        );
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!(
+            "deepseek_live: DEEPSEEK_API_KEY is empty — skipping optional DeepSeek smoke test"
+        );
+        return;
+    }
+    let cache = xdg_cache_for("deepseek");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = deepseek::fetch::Endpoints::default();
+    let out = deepseek::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect(
+        "deepseek fetch should succeed against the real API \
+         (note: deepseek::fetch remaps live HTTP errors to \"no usable cache\" \
+         when nothing is cached — a bogus key fails with that message)",
+    );
+
+    assert!(
+        !out.snapshot.currency.is_empty(),
+        "deepseek currency label empty"
+    );
+    assert!(
+        out.snapshot.balance.is_finite() && out.snapshot.balance >= 0.0,
+        "deepseek: balance is not a sane amount: {}",
+        out.snapshot.balance
+    );
+    assert!(
+        out.snapshot.granted.is_finite()
+            && out.snapshot.granted >= 0.0
+            && out.snapshot.topped_up.is_finite()
+            && out.snapshot.topped_up >= 0.0,
+        "deepseek: negative balance component — shape changed? granted={} topped_up={}",
+        out.snapshot.granted,
+        out.snapshot.topped_up
+    );
+    println!(
+        "✅ deepseek — available={}, balance={} {} (granted {}, topped up {})",
+        out.snapshot.is_available,
+        out.snapshot.balance,
+        out.snapshot.currency,
+        out.snapshot.granted,
+        out.snapshot.topped_up,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn kilo_live() {
+    let Ok(api_key) = std::env::var("KILO_API_KEY") else {
+        eprintln!("kilo_live: KILO_API_KEY is unset — skipping optional Kilo smoke test");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("kilo_live: KILO_API_KEY is empty — skipping optional Kilo smoke test");
+        return;
+    }
+    let cache = xdg_cache_for("kilo");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = kilo::fetch::Endpoints::default();
+    let out = kilo::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+        None,
+    )
+    .await
+    .expect("kilo fetch should succeed against the real API");
+
+    assert!(!out.snapshot.label.is_empty(), "kilo label empty");
+    assert!(
+        out.snapshot.balance.is_finite() && out.snapshot.balance >= 0.0,
+        "kilo: balance is not a sane amount: {}",
+        out.snapshot.balance
+    );
+    println!("✅ kilo — balance ${:.2}", out.snapshot.balance);
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn novita_live() {
+    let Ok(api_key) = std::env::var("NOVITA_API_KEY") else {
+        eprintln!("novita_live: NOVITA_API_KEY is unset — skipping optional Novita smoke test");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("novita_live: NOVITA_API_KEY is empty — skipping optional Novita smoke test");
+        return;
+    }
+    let cache = xdg_cache_for("novita");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = novita::fetch::Endpoints::default();
+    let out = novita::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("novita fetch should succeed against the real API");
+
+    for (name, amount) in [
+        ("available", out.snapshot.available),
+        ("cash", out.snapshot.cash),
+        ("credit_limit", out.snapshot.credit_limit),
+        ("outstanding", out.snapshot.outstanding),
+    ] {
+        assert!(
+            amount.is_finite() && amount >= 0.0,
+            "novita: {name} is not a sane amount: {amount}"
+        );
+    }
+    println!(
+        "✅ novita — available ${:.2}, cash ${:.2}, limit ${:.2}, outstanding ${:.2}",
+        out.snapshot.available,
+        out.snapshot.cash,
+        out.snapshot.credit_limit,
+        out.snapshot.outstanding,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn moonshot_live() {
+    let Ok(api_key) = std::env::var("MOONSHOT_API_KEY") else {
+        eprintln!(
+            "moonshot_live: MOONSHOT_API_KEY is unset — skipping optional Moonshot smoke test"
+        );
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!(
+            "moonshot_live: MOONSHOT_API_KEY is empty — skipping optional Moonshot smoke test"
+        );
+        return;
+    }
+    let region = std::env::var("MOONSHOT_REGION").unwrap_or_else(|_| "global".to_string());
+    let (endpoints, currency) = moonshot::fetch::Endpoints::for_region(&region);
+    let cache = xdg_cache_for("moonshot");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let out = moonshot::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+        currency,
+    )
+    .await
+    .expect("moonshot fetch should succeed against the real API");
+
+    assert!(
+        out.snapshot.available.is_finite() && out.snapshot.available >= 0.0,
+        "moonshot: available balance is not a sane amount: {}",
+        out.snapshot.available
+    );
+    assert!(
+        out.snapshot.cash.is_finite(),
+        "moonshot: cash balance is not finite: {}",
+        out.snapshot.cash
+    );
+    assert!(
+        !out.snapshot.currency.is_empty(),
+        "moonshot currency label empty"
+    );
+    println!(
+        "✅ moonshot ({}) — available {} {} (cash {}, voucher {})",
+        region,
+        out.snapshot.available,
+        out.snapshot.currency,
+        out.snapshot.cash,
+        out.snapshot.voucher,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn grok_live() {
+    let Ok(management_key) = std::env::var("XAI_MANAGEMENT_KEY") else {
+        eprintln!("grok_live: XAI_MANAGEMENT_KEY is unset — skipping optional Grok smoke test");
+        return;
+    };
+    if management_key.trim().is_empty() {
+        eprintln!("grok_live: XAI_MANAGEMENT_KEY is empty — skipping optional Grok smoke test");
+        return;
+    }
+    let team_id = std::env::var("XAI_TEAM_ID").ok();
+    let cache = xdg_cache_for("grok");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = grok::fetch::Endpoints::default();
+    let out = grok::fetch_snapshot(
+        &client,
+        &management_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+        team_id.as_deref(),
+    )
+    .await
+    .expect("grok fetch should succeed against the real API");
+
+    assert!(
+        out.snapshot.balance.is_finite(),
+        "grok: balance is not finite: {}",
+        out.snapshot.balance
+    );
+    println!("✅ grok — prepaid balance ${:.2}", out.snapshot.balance);
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn opencode_go_live() {
+    let Ok(api_key) = std::env::var("OPENCODE_GO_API_KEY") else {
+        eprintln!(
+            "opencode_go_live: OPENCODE_GO_API_KEY is unset — skipping optional OpenCode Go smoke test"
+        );
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!(
+            "opencode_go_live: OPENCODE_GO_API_KEY is empty — skipping optional OpenCode Go smoke test"
+        );
+        return;
+    }
+    let cache = xdg_cache_for("opencode-go");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = opencode_go::fetch::Endpoints::default();
+    let out = opencode_go::fetch::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("opencode-go fetch should succeed against the real API");
+
+    // The parser rejects a response with no supported windows, so reaching
+    // here already proves at least one exists.
+    for (label, window) in [
+        ("rolling", &out.snapshot.rolling),
+        ("weekly", &out.snapshot.weekly),
+        ("monthly", &out.snapshot.monthly),
+    ] {
+        if let Some(window) = window.as_ref() {
+            assert!(
+                (0.0..=100.0).contains(&window.percent),
+                "opencode-go.{label}: percent {} outside [0,100] — shape changed?",
+                window.percent
+            );
+        }
+    }
+    println!(
+        "✅ opencode-go — rolling={:?}%, weekly={:?}%, monthly={:?}%",
+        out.snapshot.rolling.as_ref().map(|w| w.percent),
+        out.snapshot.weekly.as_ref().map(|w| w.percent),
+        out.snapshot.monthly.as_ref().map(|w| w.percent),
+    );
+}
+
+/// Organization **Admin** key (`sk-ant-admin01-…`) — inference keys are
+/// rejected by the cost report endpoint with 403, worth seeing verbatim.
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn anthropic_api_live() {
+    let Ok(api_key) = std::env::var("ANTHROPIC_ADMIN_KEY") else {
+        eprintln!(
+            "anthropic_api_live: ANTHROPIC_ADMIN_KEY is unset — skipping optional Anthropic API smoke test"
+        );
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!(
+            "anthropic_api_live: ANTHROPIC_ADMIN_KEY is empty — skipping optional Anthropic API smoke test"
+        );
+        return;
+    }
+    let cache = xdg_cache_for("anthropic-api");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = anthropic_api::fetch::Endpoints::default();
+    let out = anthropic_api::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+        None,
+    )
+    .await
+    .expect("anthropic-api fetch should succeed against the real Admin API");
+
+    assert!(
+        out.snapshot.spent.is_finite() && out.snapshot.spent >= 0.0,
+        "anthropic-api: month-to-date spend is not a sane amount: {}",
+        out.snapshot.spent
+    );
+    println!(
+        "✅ anthropic-api — ${:.2} month-to-date (limit {:?})",
+        out.snapshot.spent, out.snapshot.limit,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn antigravity_live() {
+    let cache = xdg_cache_for("antigravity");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    // Loopback discovery is the credential source here: nothing listening
+    // locally is this vendor's "unconfigured" state, not a failure.
+    let fetched = antigravity::fetch_snapshot(&client, &cache, Duration::from_secs(0)).await;
+    let out = match fetched {
+        Err(AppError::Credentials(msg)) if msg.contains("no local server found") => {
+            eprintln!(
+                "antigravity_live: no local Antigravity server discovered — skipping (open the Antigravity app or an interactive `agy` session, or set ANTIGRAVITY_LS_ADDRESS)"
+            );
+            return;
+        }
+        other => other.expect("antigravity fetch should succeed against the local server"),
+    };
+
+    assert!(
+        !out.snapshot.plan.is_empty(),
+        "antigravity plan label empty"
+    );
+    assert_pct("antigravity.session", out.snapshot.session.utilization_pct);
+    assert_pct("antigravity.weekly", out.snapshot.weekly.utilization_pct);
+    if let Some(w) = out.snapshot.third_party_session.as_ref() {
+        assert_pct("antigravity.third_party_session", w.utilization_pct);
+    }
+    if let Some(w) = out.snapshot.third_party_weekly.as_ref() {
+        assert_pct("antigravity.third_party_weekly", w.utilization_pct);
+    }
+    println!(
+        "✅ antigravity — plan={}, gemini 5h {}% / week {}%, claude-gpt 5h {:?} / week {:?}",
+        out.snapshot.plan,
+        out.snapshot.session.utilization_pct,
+        out.snapshot.weekly.utilization_pct,
+        out.snapshot
+            .third_party_session
+            .as_ref()
+            .map(|w| w.utilization_pct),
+        out.snapshot
+            .third_party_weekly
+            .as_ref()
+            .map(|w| w.utilization_pct),
     );
 }

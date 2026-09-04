@@ -786,6 +786,31 @@ const meteredBalance = model.parseReport(JSON.stringify({entries: [{
 }]})).entries[0];
 assert.equal(model.headline(meteredBalance).text, '$75.00');
 
+// The Rust core precomputes the headline (report.rs `headline_pick`); when
+// present it is authoritative — the sections are not re-walked.
+const precomputed = model.parseReport(JSON.stringify({entries: [{
+  id: 'openrouter', error: null,
+  headline: {text: '$75.00', percent: 25, severity: 'high', label: 'Credit balance', reset_at: ''},
+  sections: [{type: 'metric', label: 'Credit balance', percent: 25, value: '$75.00', detail: ''}]
+}]})).entries[0];
+const pre = model.headline(precomputed);
+assert.equal(pre.text, '$75.00');
+assert.equal(pre.severity, 'high');
+assert.equal(pre.label, 'Credit balance');
+// A headline the core marked null (nothing reportable) falls back to the
+// local walk, which ends on the terminal "Ready" text.
+const noHeadline = model.parseReport(JSON.stringify({entries: [{
+  id: 'vendor', error: null, headline: null,
+  sections: [{type: 'text', label: 'Vendor', value: 'text'}]
+}]})).entries[0];
+assert.equal(model.headline(noHeadline).text, 'Ready');
+// A malformed headline object is dropped by normalization, not trusted.
+const malformed = model.parseReport(JSON.stringify({entries: [{
+  id: 'vendor', error: null, headline: {text: ''},
+  sections: [{type: 'text', label: 'Balance', value: '$1.00'}]
+}]})).entries[0];
+assert.equal(model.headline(malformed).text, '$1.00');
+
 assert.equal(model.parseReport('{').ok, false);
 assert.equal(model.parseReport('{}').ok, false);
 assert.equal(model.parseReport('{"entries":[{"name":"missing id"}]}').ok, false);
