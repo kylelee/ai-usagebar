@@ -131,7 +131,7 @@ jobs:
       # release.
       - name: Set up QEMU binfmt (run arm64 containers on the x86_64 runner)
         if: matrix.builder == 'cross'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
 
       - name: Smoke the aarch64 binary under qemu (version + usage JSON)
         if: matrix.builder == 'cross'
