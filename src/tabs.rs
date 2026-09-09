@@ -473,12 +473,16 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Deepseek => {
-            let api_key = crate::config::resolve_api_key(
+            let api_key = key_account_api_key(
+                config,
+                VendorId::Deepseek,
                 "DeepSeek",
+                "deepseek",
                 &config.deepseek.api_key_env,
                 config.deepseek.api_key.as_deref(),
+                tab,
             )?;
-            let cache = crate::cache::Cache::for_vendor("deepseek")?;
+            let cache = key_account_cache("deepseek", tab)?;
             let endpoints = crate::deepseek::fetch::Endpoints::default();
             let outcome =
                 crate::deepseek::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
@@ -1886,6 +1890,55 @@ mod tests {
         assert_eq!(
             tabs,
             vec![TabId::vendor(VendorId::Zai), TabId::vendor(VendorId::Kimi)]
+        );
+    }
+
+    #[test]
+    fn deepseek_numbered_accounts_yield_account_tabs() {
+        let mut config = Config::default();
+        config.anthropic.enabled = false;
+        config.openai.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.enabled = false;
+        config.deepseek.enabled = true;
+        config.deepseek.accounts = vec![crate::config::KeyAccount {
+            label: "1".into(),
+            api_key_env: None,
+            api_key: Some("d1".into()),
+            monthly_limit: None,
+        }];
+        // The default section carries no key, so it is a dead node next to the
+        // numbered account — only `deepseek@1` remains.
+        assert_eq!(
+            build_tabs(&config, &[], &no_creds()),
+            vec![TabId::account_for(VendorId::Deepseek, "1")]
+        );
+    }
+
+    #[test]
+    fn deepseek_account_tab_resolves_the_account_key_not_the_default() {
+        let mut config = Config::default();
+        config.deepseek.enabled = true;
+        config.deepseek.accounts = vec![crate::config::KeyAccount {
+            label: "1".into(),
+            api_key_env: None,
+            api_key: Some("account-key".into()),
+            monthly_limit: None,
+        }];
+        let tab = TabId::account_for(VendorId::Deepseek, "1");
+        let key = key_account_api_key(
+            &config,
+            VendorId::Deepseek,
+            "DeepSeek",
+            "deepseek",
+            &config.deepseek.api_key_env,
+            config.deepseek.api_key.as_deref(),
+            &tab,
+        )
+        .unwrap();
+        assert_eq!(
+            key, "account-key",
+            "the account's own key, never the default's"
         );
     }
 
