@@ -1817,6 +1817,11 @@ fn apply_key_account_mutations(
                         })?;
                     apply_account_key_to_table(table, api_key.as_ref())?;
                     apply_limit_to_table(table, limit)?;
+                    // A key arriving through the default card opts the vendor
+                    // in, matching the plain key-card and Add behaviours.
+                    if matches!(api_key, Some(AccountKeyMutation::Set { .. })) {
+                        set_bool(doc, spec.section, "enabled", true)?;
+                    }
                 } else {
                     let index = account_index(spec.display, label, live_count)?;
                     let accounts = accounts_array_mut(doc, spec.section)?;
@@ -2608,6 +2613,24 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["1"]);
         assert_eq!(cfg.deepseek.accounts[0].api_key.as_deref(), Some("d2"));
+    }
+
+    /// The DEFAULT card's Apply (a `label:""` update) opts the vendor in
+    /// exactly like Add and the plain key-card: a fresh install's first key
+    /// lands in the default section, and it must flip `enabled` too —
+    /// otherwise the vendor never enters the report and stays off the bar.
+    #[test]
+    fn default_card_update_flips_enabled_like_add_and_overlay() {
+        let (_td, path) = temp_config(None);
+        let patch = r#"{"schema_version":1,"accounts":{
+            "deepseek":[{"action":"update","label":"","api_key":{"action":"set","value":"d1"}}]}}"#;
+        apply_settings_json_to_path(&Config::default(), patch, &path).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.deepseek.api_key.as_deref(), Some("d1"));
+        assert!(
+            cfg.deepseek.enabled,
+            "a key through the default card opts the vendor in"
+        );
     }
 
     /// Overlay parity with the Omarchy form: the `s` overlay saves the OpenAI
