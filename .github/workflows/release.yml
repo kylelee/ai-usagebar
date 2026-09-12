@@ -109,7 +109,7 @@ jobs:
 
       - name: Install cross (aarch64 cross-compile via Docker)
         if: matrix.builder == 'cross'
-        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2
         with:
           tool: cross
 
