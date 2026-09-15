@@ -347,9 +347,10 @@ enabled = false
 # — a pay-as-you-go key has no plan quota to report.
 enabled = false
 # api_key = "paste-your-key-here"
-# Region picks the INSTANCE, and the two issue separate keys — pointing this
-# at the wrong one reads as an invalid key, not an empty plan:
-#   global -> api.minimax.io   |   cn -> api.minimaxi.com
+# Region picks the INSTANCE, and the two issue separate keys:
+#   global -> api.minimax.io   |   cn -> api.minimax.cn
+# A key rejected by one is retried once against the other, so a CN key on the
+# default global region still shows figures — set `cn` to skip that retry.
 # region = "global"
 # Extra keys, each its own entry everywhere: [[minimax.accounts]] with
 # just api_key (auto-named 1, 2, … by position) — the shared multi-account

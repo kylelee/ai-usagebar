@@ -1,11 +1,13 @@
 //! MiniMax fetch — reads Token Plan quota from `/v1/token_plan/remains` under
 //! the shared cache + flock primitives.
 //!
-//! The host is region-dependent (`api.minimax.io` global, `api.minimaxi.com`
+//! The host is region-dependent (`api.minimax.io` global, `api.minimax.cn`
 //! CN) and, unlike Moonshot's regions, the two are *separate instances*: a key
 //! issued for one is rejected by the other. That makes a cached figure from the
 //! other region not merely stale but wrong, so the endpoint is recorded in the
-//! payload and a mismatched cache is discarded.
+//! payload and a mismatched cache is discarded. A key rejected by the
+//! configured instance is retried once against its sibling before the fetch is
+//! declared an auth failure — see [`Endpoints::sibling`].
 
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 use super::types::{RemainsEnvelope, is_auth_failure, to_snapshot};
 
 pub const BASE_GLOBAL: &str = "https://api.minimax.io";
-pub const BASE_CN: &str = "https://api.minimaxi.com";
+pub const BASE_CN: &str = "https://api.minimax.cn";
 
 /// Label shown as the plan name. The quota endpoint doesn't name the plan, and
 /// inventing a tier from the numbers would be a guess, so the product name is
@@ -28,20 +30,27 @@ pub const PLAN_LABEL: &str = "MiniMax Token Plan";
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub remains: String,
+    /// The same route on the other instance. MiniMax's `2049` literally means
+    /// "this key was issued by the sibling deployment", so one retry there —
+    /// before giving up — turns a mis-set `region` (the default `global`
+    /// against a CN subscription key, and vice versa) into real figures
+    /// instead of an auth error. `None` when there is no sibling to consult.
+    pub sibling: Option<String>,
 }
 
 impl Endpoints {
-    /// Pick the host by region. `cn` → `api.minimaxi.com`, anything else →
+    /// Pick the host by region. `cn` → `api.minimax.cn`, anything else →
     /// `api.minimax.io`. No currency is implied: MiniMax reports quota as
     /// percentages, not money.
     pub fn for_region(region: &str) -> Self {
-        let base = if region.eq_ignore_ascii_case("cn") {
-            BASE_CN
+        let (base, sibling) = if region.eq_ignore_ascii_case("cn") {
+            (BASE_CN, BASE_GLOBAL)
         } else {
-            BASE_GLOBAL
+            (BASE_GLOBAL, BASE_CN)
         };
         Self {
             remains: format!("{base}/v1/token_plan/remains"),
+            sibling: Some(format!("{sibling}/v1/token_plan/remains")),
         }
     }
 }
@@ -66,7 +75,7 @@ pub async fn fetch_snapshot(
         cache,
         Duration::from_secs(fetch::LOCK_TIMEOUT_SECS),
         cache_ttl,
-        fetch_live(client, endpoints, api_key),
+        fetch_live_with_sibling_fallback(client, endpoints, api_key),
         |payload| parse_cache(payload.as_bytes(), &target).ok(),
         |snap| {
             serde_json::to_string(&serde_json::json!({
@@ -77,6 +86,40 @@ pub async fn fetch_snapshot(
         },
     )
     .await
+}
+
+/// Fetch from the configured instance, consulting the sibling once when the
+/// configured one rejects the key. `2049` in-band (mapped to 401 below) and a
+/// plain 401/403 both mean "this key was issued by the other deployment", so a
+/// mis-set `region` — the default `global` against a CN subscription key, or
+/// vice versa — still yields real figures instead of an auth error. The
+/// sibling's snapshot is cached under the CONFIGURED target: the key
+/// fingerprint still scopes it to this account, and fixing `region` later
+/// re-targets the cache cleanly. When the sibling fails too, the configured
+/// instance's error is the one reported — it is the host the user pointed at.
+async fn fetch_live_with_sibling_fallback(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    api_key: &str,
+) -> Result<MinimaxSnapshot> {
+    match fetch_live(client, endpoints, api_key).await {
+        Err(err @ AppError::Http { status: 401 | 403, .. }) => {
+            let Some(sibling) = endpoints.sibling.clone() else {
+                return Err(err);
+            };
+            fetch_live(
+                client,
+                &Endpoints {
+                    remains: sibling,
+                    sibling: None,
+                },
+                api_key,
+            )
+            .await
+            .or(Err(err))
+        }
+        other => other,
+    }
 }
 
 /// Identity of the account and instance the cached quota belongs to. Global
@@ -239,6 +282,9 @@ mod tests {
     fn endpoints_for(server: &mockito::Server) -> Endpoints {
         Endpoints {
             remains: format!("{}/v1/token_plan/remains", server.url()),
+            // Sibling: None keeps these mocks single-instance — the fallback
+            // has its own two-server tests below.
+            sibling: None,
         }
     }
 
@@ -253,6 +299,104 @@ mod tests {
         assert!(Endpoints::for_region("CN").remains.starts_with(BASE_CN));
         // Anything unrecognized stays on the global instance.
         assert!(Endpoints::for_region("").remains.starts_with(BASE_GLOBAL));
+    }
+
+    #[test]
+    fn each_region_carries_the_other_instance_as_sibling() {
+        let global = Endpoints::for_region("global");
+        assert_eq!(
+            global.sibling.as_deref(),
+            Some("https://api.minimax.cn/v1/token_plan/remains")
+        );
+        let cn = Endpoints::for_region("cn");
+        assert_eq!(
+            cn.sibling.as_deref(),
+            Some("https://api.minimax.io/v1/token_plan/remains")
+        );
+    }
+
+    /// A key rejected by the configured instance (the default `global`
+    /// against a CN subscription key) is retried once on the sibling and the
+    /// figures still surface — cached under the configured target.
+    #[tokio::test]
+    async fn auth_failure_on_the_configured_instance_falls_back_to_the_sibling() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut sibling = mockito::Server::new_async().await;
+        primary
+            .mock("GET", "/v1/token_plan/remains")
+            .match_header("authorization", "Bearer mm-test")
+            .with_status(200)
+            .with_body(r#"{"base_resp":{"status_code":2049,"status_msg":"invalid api key"}}"#)
+            .create_async()
+            .await;
+        sibling
+            .mock("GET", "/v1/token_plan/remains")
+            .match_header("authorization", "Bearer mm-test")
+            .with_status(200)
+            .with_body(LIVE_BODY)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let endpoints = Endpoints {
+            remains: format!("{}/v1/token_plan/remains", primary.url()),
+            sibling: Some(format!("{}/v1/token_plan/remains", sibling.url())),
+        };
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "mm-test",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.snapshot.session.utilization_pct, 1);
+        assert!(!out.stale);
+    }
+
+    /// When both instances reject the key, the CONFIGURED instance's auth
+    /// error is the one reported.
+    #[tokio::test]
+    async fn sibling_failure_keeps_the_configured_instance_error() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut sibling = mockito::Server::new_async().await;
+        primary
+            .mock("GET", "/v1/token_plan/remains")
+            .with_status(200)
+            .with_body(r#"{"base_resp":{"status_code":2049,"status_msg":"invalid api key"}}"#)
+            .create_async()
+            .await;
+        sibling
+            .mock("GET", "/v1/token_plan/remains")
+            .with_status(200)
+            .with_body(r#"{"base_resp":{"status_code":1004,"status_msg":"no api key"}}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let endpoints = Endpoints {
+            remains: format!("{}/v1/token_plan/remains", primary.url()),
+            sibling: Some(format!("{}/v1/token_plan/remains", sibling.url())),
+        };
+        let err = fetch_snapshot(
+            &reqwest::Client::new(),
+            "bad",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            AppError::Http { status, ref body } => {
+                assert_eq!(status, 401);
+                assert!(body.contains("authentication"), "body was {body:?}");
+            }
+            other => panic!("expected HTTP 401, got {other:?}"),
+        }
     }
 
     #[tokio::test]
