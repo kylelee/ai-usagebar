@@ -114,7 +114,7 @@ enabled = true             # disabled by default; a Kimi Code CLI login is enoug
 [minimax]
 enabled = true             # disabled by default; enable once you add an API key
 
-# region = "global"        # global -> api.minimax.io | cn -> api.minimaxi.com
+# region = "global"        # global -> api.minimax.io | cn -> api.minimax.cn
 # Extra keys, each its own entry everywhere: [[minimax.accounts]] with just
 # api_key (auto-named 1, 2, … by position) — the shared multi-account shape
 # every key vendor takes.

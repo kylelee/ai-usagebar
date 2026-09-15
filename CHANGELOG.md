@@ -35,6 +35,16 @@ Each release is also published at
   on the release workflow, and a qemu-boot smoke test of the aarch64
   release binary before publishing.
 
+### Fixed
+
+- **MiniMax now works for China (domestic) Token Plan keys.** The CN instance
+  moved to `api.minimax.cn` (the old `api.minimaxi.com` spelling is gone from
+  the config docs), and a key the configured instance rejects (`2049`) is
+  retried once against the other instance before reporting an auth failure —
+  so a CN subscription key works even on the default `global` region instead
+  of showing "MiniMax authentication failed". Setting `region = "cn"` remains
+  the explicit fix and skips the extra request.
+
 ### Changed
 
 - **Error states guide instead of alarming.** A vendor that is simply

@@ -13,7 +13,7 @@ defensive and includes opt-in live tests for catching response changes.
 | **OpenRouter** | `openrouter.ai/api/v1/{credits,key}` (documented) | Balance, today/week/month spend, free vs paid tier | All frontends |
 | **DeepSeek** | `api.deepseek.com/user/balance` (documented) | Balance, granted, topped-up credits | All frontends |
 | **Kimi** | `api.kimi.com\|.ai/coding/v1/usages` (undocumented; community-confirmed), plus `auth.kimi.com\|.ai/api/oauth/token` to refresh a Kimi Code CLI login | Weekly subscription quota + 5h rolling rate-limit window | Omarchy/KDE/macOS |
-| **MiniMax** | `api.minimax.io/v1/token_plan/remains` (official Token Plan quota route) | Token Plan rolling interval window + weekly, per model bucket (text, video) | Omarchy/KDE |
+| **MiniMax** | `api.minimax.io\|.cn/v1/token_plan/remains` (official Token Plan quota route) | Token Plan rolling interval window + weekly, per model bucket (text, video) | Omarchy/KDE |
 | **Kilo** | `api.kilo.ai/api/profile/balance` (undocumented; extension-internal) | Remaining credit balance ($) | Omarchy/KDE/macOS |
 | **Novita** | `api.novita.ai/openapi/v1/billing/balance/detail` (documented) | Remaining credit balance ($) | Omarchy/KDE/macOS |
 | **Moonshot** | `api.moonshot.ai\|.cn/v1/users/me/balance` (documented) | Account balance ($ on `.ai`, ¥ on `.cn`) | Omarchy/KDE/macOS |

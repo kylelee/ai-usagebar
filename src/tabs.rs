@@ -606,12 +606,16 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Minimax => {
-            let api_key = crate::config::resolve_api_key(
+            let api_key = key_account_api_key(
+                config,
+                VendorId::Minimax,
                 "MiniMax",
+                "minimax",
                 &config.minimax.api_key_env,
                 config.minimax.api_key.as_deref(),
+                tab,
             )?;
-            let cache = crate::cache::Cache::for_vendor("minimax")?;
+            let cache = key_account_cache("minimax", tab)?;
             let endpoints = crate::minimax::fetch::Endpoints::for_region(&config.minimax.region);
             let outcome =
                 crate::minimax::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
@@ -1933,6 +1937,33 @@ mod tests {
             "deepseek",
             &config.deepseek.api_key_env,
             config.deepseek.api_key.as_deref(),
+            &tab,
+        )
+        .unwrap();
+        assert_eq!(
+            key, "account-key",
+            "the account's own key, never the default's"
+        );
+    }
+
+    #[test]
+    fn minimax_account_tab_resolves_the_account_key_not_the_default() {
+        let mut config = Config::default();
+        config.minimax.enabled = true;
+        config.minimax.accounts = vec![crate::config::KeyAccount {
+            label: "1".into(),
+            api_key_env: None,
+            api_key: Some("account-key".into()),
+            monthly_limit: None,
+        }];
+        let tab = TabId::account_for(VendorId::Minimax, "1");
+        let key = key_account_api_key(
+            &config,
+            VendorId::Minimax,
+            "MiniMax",
+            "minimax",
+            &config.minimax.api_key_env,
+            config.minimax.api_key.as_deref(),
             &tab,
         )
         .unwrap();

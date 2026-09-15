@@ -555,11 +555,12 @@ pub struct MinimaxConfig {
     pub enabled: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
-    /// `"global"` → api.minimax.io; `"cn"` → api.minimaxi.com. Unlike
+    /// `"global"` → api.minimax.io; `"cn"` → api.minimax.cn. Unlike
     /// Moonshot's, this does not change the unit — MiniMax reports quota as a
     /// percentage either way. It picks the *instance*: a key issued for one
-    /// host is rejected by the other (`status_code 2049`), so pointing this at
-    /// the wrong region reads as an invalid key rather than an empty plan.
+    /// host is rejected by the other (`status_code 2049`), so a rejected key
+    /// is retried once against the other instance before reporting an auth
+    /// failure — this setting picks the primary host, not a hard boundary.
     pub region: String,
     /// Extra keys beyond the default one (`[[vendor.accounts]]`): each entry
     /// gets its own tab, tile, and isolated cache, auto-named by its
