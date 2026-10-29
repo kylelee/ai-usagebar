@@ -23,6 +23,13 @@ Column {
   // in its delegate (replacing a model array on every keystroke rebuilds
   // the delegates and drops TextField focus after one character).
   property string selectedPrimary: ""
+  // The primary sent by the last save that carried one — and not yet
+  // confirmed by a successful reload. While it is outstanding every save
+  // re-sends the current selection: the backend writes primary BEFORE the
+  // account mutations, so a mid-save failure leaves the file changed while
+  // snapshot.primary still holds the old value, and a diff-only rollback
+  // to that old value would strand the half-written primary.
+  property string lastSentPrimary: ""
   property string stateStdout: ""
   property string stateStderr: ""
   property string applyStdout: ""
@@ -69,7 +76,7 @@ Column {
       errorText = detail.indexOf("unrecognized subcommand") >= 0
         ? "This installed ai-usagebar-omarchy binary predates native settings. Update the package, or use the terminal settings fallback."
         : detail
-      snapshot = ({ primary_choices: [], keys: [] })
+      snapshot = ({ primary_choices: [], keys: [], accounts: [] })
       selectedPrimary = ""
       return
     }
@@ -83,6 +90,10 @@ Column {
     snapshot = parsed
     selectedPrimary = parsed.primary
     hasLoaded = true
+    // A fresh snapshot is the new diff baseline: the outstanding primary
+    // intent it covers is confirmed (successful save) or moot (panel
+    // reopened elsewhere) — stop re-sending it either way.
+    lastSentPrimary = ""
   }
 
   // Explicit leave: clear pending secrets and drafts. Contrast the hide
@@ -99,11 +110,29 @@ Column {
 
   function save() {
     if (!canSave) return
-    var built = Model.buildSettingsPatch(selectedPrimary, collectChanges(), collectAccountChanges())
+    // primary rides the patch ONLY when the user moved the dropdown:
+    // `settings show` reports the resolved primary (a configured-but-
+    // disabled provider falls back to the first choice), and echoing that
+    // back would silently rewrite config.toml on every save. An empty
+    // first argument means "leave [ui] primary byte-for-byte untouched".
+    // The snapshot diff alone can also swallow a ROLLBACK: the backend
+    // writes primary before the account mutations, so a mid-save failure
+    // leaves the file carrying the previous intent while snapshot.primary
+    // still shows the old value. Until a successful save reloads (which
+    // clears lastSentPrimary in finishLoad), an outstanding intent keeps
+    // re-sending whatever the dropdown holds now.
+    var primaryChanged = selectedPrimary !== snapshot.primary
+    var sendPrimary = primaryChanged
+      || (lastSentPrimary !== "" && selectedPrimary !== "")
+    var built = Model.buildSettingsPatch(
+      sendPrimary ? selectedPrimary : "",
+      collectChanges(), collectAccountChanges())
     if (!built.ok) {
       errorText = built.error
       return
     }
+    if (sendPrimary && selectedPrimary !== "")
+      lastSentPrimary = selectedPrimary
     saving = true
     errorText = ""
     statusText = ""
@@ -553,7 +582,7 @@ Column {
                 PanelActionButton {
                   anchors.right: parent.right
                   anchors.verticalCenter: draftTitle.verticalCenter
-                  iconText: "󰆴"
+                  iconText: "󰅖"
                   tooltipText: "Discard this draft"
                   foreground: root.foreground
                   hoverColor: root.urgent
@@ -902,14 +931,17 @@ Column {
                 onAccepted: root.save()
               }
 
+              // Eraser, not the header's trash glyph: two identical trash
+              // cans read as "remove the account" and users wiped keys
+              // by mistake. Red stays exclusive to removing the account.
               PanelActionButton {
                 id: accountKeyClear
                 anchors.verticalCenter: accountKeyField.verticalCenter
-                iconText: accountCard.apiKeyAction === "clear" ? "󰕌" : "󰆴"
+                iconText: accountCard.apiKeyAction === "clear" ? "󰕌" : "󰇾"
                 tooltipText: accountCard.apiKeyAction === "clear"
                   ? "Keep the stored key" : "Clear the stored inline key"
                 foreground: root.foreground
-                hoverColor: accountCard.apiKeyAction === "clear" ? root.foreground : root.urgent
+                hoverColor: accountCard.apiKeyAction === "clear" ? root.foreground : root.dim
                 fontFamily: root.fontFamily
                 enabled: !root.saving
                   && (accountCard.card.inline_configured || accountCard.apiKeyAction === "clear")
@@ -935,6 +967,9 @@ Column {
               wrapMode: Text.WordWrap
             }
 
+            // Stays enabled while pendingRemove: this Apply is what
+            // submits the removal — greying it out armed the delete and
+            // then hid the only nearby way to commit it.
             Button {
               width: parent.width
               text: root.saving ? "Saving…" : "Apply"
@@ -944,7 +979,7 @@ Column {
               focusable: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              enabled: root.canSave && !accountCard.pendingRemove
+              enabled: root.canSave
               onClicked: root.save()
             }
           }

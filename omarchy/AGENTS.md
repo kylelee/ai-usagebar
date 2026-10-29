@@ -10,8 +10,8 @@ entry point `omarchy/BarWidget.qml`; validate with `omarchy plugin validate .`.
 BarWidget.qml (215)  # manifest entry: bar tile + click/wheel routing
 Panel.qml (886)      # popup: per-account detail, per-figure colors, countdowns
 SettingsView.qml(996)# native settings form (account cards, add/delete, Apply)
-Model.js (951)       # PURE adapter: `usage --json` report → QML model. No fetching.
-model.test.mjs (1062)# node contract tests for Model.js — `make plugin-test`
+Model.js (918)       # PURE adapter: `usage --json` report → QML model. No fetching.
+model.test.mjs (1058)# node contract tests for Model.js — `make plugin-test`
 logos/               # per-vendor icons
 ```
 
@@ -19,7 +19,7 @@ logos/               # per-vendor icons
 
 | Task | Do |
 |------|----|
-| Bar tile look | `BarWidget.qml` — per-figure range colors, account tag stays neutral |
+| Bar tile look | `BarWidget.qml` — per-figure range colors, per-countdown clock bands, account tag stays neutral |
 | Panel rows/sections | `Panel.qml` — projects `sections` ordered rows from the report |
 | Add settings UI | `SettingsView.qml` + keep `src/config.rs` + `src/tui/settings.rs` in sync |
 | Report field consumption | `Model.js` only — QML never parses vendor JSON itself |

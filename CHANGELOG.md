@@ -37,6 +37,30 @@ Each release is also published at
 
 ### Fixed
 
+- **Deleting an extra key account actually deletes it.** The Omarchy settings
+  card wore the same trash glyph on two different buttons — "remove this
+  account" in the header and "clear the stored key" next to the field — so the
+  wrong one got clicked and the account stayed. The key-clear button is an
+  eraser now (drafts discard via a close X), the trash belongs to the account
+  alone, and a card armed for removal keeps its own Apply button enabled
+  instead of greying out the only way to commit the delete.
+
+- **Clearing an account's key no longer leaves an undead account behind.** For
+  the key-based vendors an account *is* its key, so a save that clears the last
+  key of an otherwise empty entry now drops the entry: the card disappears with
+  it instead of lingering as a no-key placeholder. Entries that still carry
+  something (`api_key_env`, a `monthly_limit`, Z.AI's billing fields) and
+  pre-existing hand-written placeholders — comments included — are left alone.
+
+- **One save can remove, edit, and add accounts again.** Positional labels were
+  resolved against the list as each mutation rewrote it, so removing "1" then
+  editing "2" in the same save either failed the whole patch (`account "2" does
+  not exist`) or, worse, wrote the edit into the *next* account — deleting one
+  account and editing another is exactly that case. Labels now name the position
+  in the list as the save started, appends still land at the end, and a label
+  already removed (or emptied by a key clear) earlier in the same save is
+  refused by name instead of quietly hitting whatever slid into its slot.
+
 - **MiniMax now works for China (domestic) Token Plan keys.** The CN instance
   moved to `api.minimax.cn` (the old `api.minimaxi.com` spelling is gone from
   the config docs), and a key the configured instance rejects (`2049`) is
@@ -45,7 +69,58 @@ Each release is also published at
   of showing "MiniMax authentication failed". Setting `region = "cn"` remains
   the explicit fix and skips the extra request.
 
+- **MiniMax status-bar tile now mirrors Z.AI.** The text pool projects as
+  `Session (5h)` + `Weekly` with each row's own window classification
+  (`window:"session"` / `window:"weekly"`) and reset countdown, so the
+  tiled bar renders `minimax 25%·2.1h 40%·3d` next to `zai` and `kimi`.
+  The video pool rows (`Video (5h)`, `Video weekly`) stay in the report
+  popup and tooltip but never reach the bar — a new `metric_window`
+  exclusion rule rejects any label containing `video` so the bar's
+  window-picker never sees them. The TUI panel and per-vendor tooltip
+  keep the existing Text/Video pool grouping.
+
+- **Balance figures read as "100%" once the precomputed headline appeared.**
+  The Rust headline fix above started shipping real `headline` objects for
+  balance vendors (`percent: null`), which exposed a latent frontend bug:
+  `finitePercent` coerced `Number(null)` → `0`, and the tile's
+  show-remaining flip rendered `100 - 0` as "100%" instead of the money
+  figure. All three native frontends (Omarchy, GNOME, KDE) now keep a null
+  percent null; a balance headline stays its own text under every setting.
+
+- **GNOME bar alarms are per-account now — a critical vendor no longer
+  reddens the whole bar.** Any account hitting a critical state (e.g. a
+  maxed 5h window) used to paint every tile's neutral text red through the
+  bar-wide `.aiub-alarm` class: the Z.AI `1`/`2` suffixes, MiniMax's tag,
+  and DeepSeek's entire balance figure all inherited the red while their
+  own figures stayed colored. Each tile's neutral text now carries its OWN
+  account's alarm only (error, stale, or critical headline); the
+  single-account robot label alarms on refresh failures, a filter miss, or
+  the shown account's own urgency. Omarchy and KDE already colored this
+  way and are unchanged.
+
+- **The precomputed report `headline` described a neighbouring row.**
+  `headline_pick` numbered the metric rows it was handed, but the caller
+  used that number to index the full section list — where spacers and the
+  title sit between metrics — so the `headline` field led with the row
+  *beside* the fullest window (a 25% session figure while weekly stood at
+  40%). The pick now indexes the same dense candidate list it was built
+  from; surfaces that fall back to `headline` (no-window tiles, older
+  binaries) agree with the window rows again.
+
 ### Changed
+
+- **Dead adapter code removed from the three frontends.** Every export was
+  re-audited against its real (non-test) consumers: GNOME's report-model.js
+  dropped `providerShort`, `settingsWithOverrides`/`settingsWithSelectedEntry`/
+  `booleanSetting` (Quattro-settings helpers GNOME never calls — it uses
+  GSettings), `barLabel`/`tileLabel`/`tiledBarLabel` (single-string label
+  forms from before the per-tile renderer), `worstBand` (orphaned by the
+  per-account alarm fix), and `mergeVendorList` (superseded by prefs.js's own
+  vendor-filter refresh); omarchy's Model.js dropped `providerShort`,
+  `settingsWithSelectedEntry`, and the pre-tiling `barLabel`, keeping
+  `tileLabel`/`tiledBarLabel` as the joined-form contract its tests pin;
+  KDE's plasmoid-logic.mjs dropped `isAlarming` (no QML consumer). Suites
+  stay green; `barEntries`/`tileParts` behavior pins are unchanged.
 
 - **Error states guide instead of alarming.** A vendor that is simply
   not configured yet — no key, no first login — is now classified

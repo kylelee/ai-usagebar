@@ -312,6 +312,11 @@ pub struct SettingsState {
     /// cannot actually be used by the widget or TUI.
     pub primary_choices: Vec<VendorId>,
     pub primary: VendorId,
+    /// True only when the primary was actually changed this session — by the
+    /// overlay's radio keys or an explicit apply-patch `primary`. A save then
+    /// persists `[ui] primary`; otherwise the stored value stays byte-for-byte
+    /// untouched (the overlay's resolved view is never echoed back).
+    pub primary_dirty: bool,
     /// One input per [`KEY_VENDORS`] entry, same order.
     pub keys: Vec<KeyInput>,
     /// The optional numeric `monthly_limit` row per [`KEY_VENDORS`] entry,
@@ -407,6 +412,7 @@ impl SettingsState {
             focus: Focus::Primary,
             primary_choices,
             primary,
+            primary_dirty: false,
             keys,
             limits,
             zai: ZaiFields::from_config(cfg),
@@ -544,7 +550,12 @@ fn handle_primary(state: &mut SettingsState, code: KeyCode) {
         KeyCode::Right | KeyCode::Char(' ') => 1,
         _ => return,
     };
-    state.primary = choices[((idx as i32 + step).rem_euclid(choices.len() as i32)) as usize];
+    let next = choices[((idx as i32 + step).rem_euclid(choices.len() as i32)) as usize];
+    if next != state.primary {
+        // A real radio move: the next save may persist the new primary.
+        state.primary_dirty = true;
+    }
+    state.primary = next;
 }
 
 fn handle_input(input: &mut KeyInput, code: KeyCode) {
@@ -588,10 +599,12 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
         })?
     };
 
-    // Do not write a disabled primary as a side effect of saving an API key.
-    // With no enabled vendors, leave any existing value alone so the legacy
-    // resolver's Anthropic fallback remains intact.
-    if state.primary_choices.contains(&state.primary) {
+    // Persist `[ui] primary` only when this operation actually changed it —
+    // an overlay radio move or an explicit apply-patch field. Otherwise the
+    // stored value stays byte-for-byte untouched (the overlay's resolved
+    // view is never echoed back), and no empty `[ui]` table is invented. A
+    // disabled primary is still never written: the resolver would ignore it.
+    if state.primary_dirty && state.primary_choices.contains(&state.primary) {
         set_string(&mut doc, "ui", "primary", state.primary.slug())?;
     }
 
@@ -1095,22 +1108,81 @@ enum AccountMutation {
     },
 }
 
-/// Resolve a settings-account address into a 0-based index into the vendor's
-/// accounts array. Accounts carry no stored names: the address IS the
-/// position ("1".."n"), and `live` bounds it by what this request has added
-/// or removed so far.
-fn account_index(vendor: &str, label: &str, live: usize) -> Result<usize> {
+/// Where a positional label points during one save: `position` is the 0-based
+/// position in the list as this save started (with the entries this same save
+/// appended at its end), `index` is where that account lives in the array
+/// RIGHT NOW, after earlier mutations removed entries in front of it.
+struct AccountAddress {
+    position: usize,
+    index: usize,
+}
+
+/// Why a snapshot position no longer exists later in the same save. Kept per
+/// position (instead of a single flat set) so the refusal can say which way
+/// the account left — an explicit remove and a key-cleared entry are both
+/// gone, but only one of them was the user's own request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemovalCause {
+    /// An explicit `remove` mutation asked for it.
+    Removed,
+    /// The request cleared the entry's API key and it had no other field
+    /// left, so the save dropped the now-empty entry on the spot.
+    Emptied,
+}
+
+/// Snapshot positions invalidated by this save, with the reason each one went.
+type RemovedPositions = BTreeMap<usize, RemovalCause>;
+
+/// Resolve a settings-account address into the vendor's accounts array.
+///
+/// Accounts carry no stored names: the address IS the position ("1".."n").
+/// Labels are snapshot positions — "2" means the account that was second when
+/// this save STARTED, never whatever sits at array index 1 after an earlier
+/// remove shifted the list left. Earlier removes are therefore subtracted when
+/// computing the current index; entries this save appends sit behind every
+/// original one, so they cannot move an original's position. `removed` is keyed
+/// by the snapshot position, so a label already removed earlier in the same
+/// save is refused instead of silently deleting whichever account slid into its
+/// slot.
+fn account_index(
+    vendor: &str,
+    label: &str,
+    base_count: usize,
+    added_count: usize,
+    removed: &RemovedPositions,
+) -> Result<AccountAddress> {
+    let live = base_count + added_count;
     let position: usize = label.parse().map_err(|_| {
         AppError::Other(format!(
-            "{vendor} accounts are addressed by position (\"1\"..\"{live}\"); {label:?} is not a position"
+            "{vendor} accounts are addressed by position (\"1\"..\"{live}\") relative to the \
+             list at the start of this save; {label:?} is not a position"
         ))
     })?;
     if position == 0 || position > live {
         return Err(AppError::Other(format!(
-            "{vendor} account {label:?} does not exist (positions are 1..={live})"
+            "{vendor} account {label:?} does not exist (positions are 1..={live}, relative to \
+             the list at the start of this save)"
         )));
     }
-    Ok(position - 1)
+    let position = position - 1;
+    // Two separate reasons, two separate messages: "you asked to remove this"
+    // and "clearing its key removed it" are different surprises, and the user
+    // can only tell them apart if the refusal names the one that happened.
+    if let Some(cause) = removed.get(&position) {
+        return Err(AppError::Other(match cause {
+            RemovalCause::Removed => {
+                format!("{vendor} account {label:?} was already removed earlier in this save")
+            }
+            RemovalCause::Emptied => format!(
+                "{vendor} account {label:?} is gone: clearing its key earlier in this save left \
+                 no other field, so the entry was removed"
+            ),
+        }));
+    }
+    Ok(AccountAddress {
+        position,
+        index: position - removed.range(..position).count(),
+    })
 }
 
 /// Legacy cleanup: account names are positional now, so a `label` key left
@@ -1388,6 +1460,8 @@ fn state_from_apply_request(cfg: &Config, raw: &str) -> Result<SettingsState> {
             )));
         }
         state.primary = id;
+        // The patch named the primary explicitly: persist exactly this value.
+        state.primary_dirty = true;
     }
 
     for (id, mutation) in request.keys {
@@ -1697,11 +1771,15 @@ fn apply_zai_mutations(
     cfg: &Config,
     mutations: &[AccountMutation],
 ) -> Result<()> {
-    // Accounts are addressed by position; `live_count` follows every add and
-    // remove in this request, in order, so a sequence like remove-2 + add
-    // composes exactly as the panel previewed it.
+    // Accounts are addressed by their position in the list as the save
+    // STARTED. The old code tracked a "live count" that every remove shrank,
+    // which made a later label point at a shifted entry (or fail at the new
+    // bound) — the classic `remove "1" + remove "2"` corruption. Keep the
+    // snapshot size plus a set of removed snapshot positions instead.
     strip_legacy_labels(doc, "zai");
-    let mut live_count = cfg.zai.accounts.len();
+    let base_count = cfg.zai.accounts.len();
+    let mut added_count = 0usize;
+    let mut removed: RemovedPositions = RemovedPositions::new();
 
     for mutation in mutations {
         match mutation {
@@ -1722,12 +1800,26 @@ fn apply_zai_mutations(
                     write_account_fields(table, &parsed)?;
                     apply_account_key_to_table(table, api_key.as_ref())?;
                 } else {
-                    let index = account_index("zai", label, live_count)?;
+                    let address = account_index("zai", label, base_count, added_count, &removed)?;
                     let accounts = accounts_array_mut(doc, "zai")?;
                     let entry = accounts
-                        .get_mut(index)
+                        .get_mut(address.index)
                         .ok_or_else(|| AppError::Other(format!("unknown zai account {label:?}")))?;
                     update_account_entry(entry, &parsed, api_key.as_ref())?;
+                    // A clear can strip the entry down to nothing (no key, no
+                    // billing field). THIS entry is the only one this save is
+                    // allowed to judge: pre-existing placeholders — even ones
+                    // holding just comments — are the user's own, and a
+                    // final sweep would silently delete them. Removing inline
+                    // also keeps later labels on their snapshot positions: the
+                    // position is recorded as gone, exactly like an explicit
+                    // remove, so nothing slides into its slot unnoticed.
+                    if matches!(api_key, Some(AccountKeyMutation::Clear))
+                        && account_entry_is_empty(entry)
+                    {
+                        remove_account_at(doc, "zai", address.index)?;
+                        removed.insert(address.position, RemovalCause::Emptied);
+                    }
                 }
             }
             AccountMutation::Add {
@@ -1743,7 +1835,7 @@ fn apply_zai_mutations(
                     apply_account_key_to_table(&mut table, Some(key))?;
                 }
                 accounts_array_mut(doc, "zai")?.push(table);
-                live_count += 1;
+                added_count += 1;
                 // A key arriving through the form opts the vendor in,
                 // matching the plain key-card behaviour.
                 if sets_key {
@@ -1774,9 +1866,12 @@ fn apply_zai_mutations(
                         table.remove(key);
                     }
                 } else {
-                    let index = account_index("zai", label, live_count)?;
-                    remove_account_at(doc, "zai", index)?;
-                    live_count -= 1;
+                    let address = account_index("zai", label, base_count, added_count, &removed)?;
+                    remove_account_at(doc, "zai", address.index)?;
+                    // Record the SNAPSHOT position, not the current index:
+                    // later labels in this save still address the list as it
+                    // looked when the save began.
+                    removed.insert(address.position, RemovalCause::Removed);
                 }
             }
         }
@@ -1795,7 +1890,12 @@ fn apply_key_account_mutations(
     mutations: &[AccountMutation],
 ) -> Result<()> {
     strip_legacy_labels(doc, spec.section);
-    let mut live_count = cfg.key_accounts(spec.id).map_or(0, |a| a.len());
+    // Snapshot addressing, same rule as zai: labels name positions in the
+    // list as this save started (plus this save's appends at the end), so an
+    // earlier remove must not renumber the labels behind it.
+    let base_count = cfg.key_accounts(spec.id).map_or(0, |a| a.len());
+    let mut added_count = 0usize;
+    let mut removed: RemovedPositions = RemovedPositions::new();
     for mutation in mutations {
         match mutation {
             AccountMutation::Update {
@@ -1823,13 +1923,23 @@ fn apply_key_account_mutations(
                         set_bool(doc, spec.section, "enabled", true)?;
                     }
                 } else {
-                    let index = account_index(spec.display, label, live_count)?;
+                    let address =
+                        account_index(spec.display, label, base_count, added_count, &removed)?;
                     let accounts = accounts_array_mut(doc, spec.section)?;
-                    let entry = accounts.get_mut(index).ok_or_else(|| {
+                    let entry = accounts.get_mut(address.index).ok_or_else(|| {
                         AppError::Other(format!("unknown {} account {label:?}", spec.display))
                     })?;
                     apply_account_key_to_table(entry, api_key.as_ref())?;
                     apply_limit_to_table(entry, limit)?;
+                    // Same inline rule as zai: only the entry this request
+                    // just cleared may be judged empty. `api_key_env`,
+                    // `monthly_limit`, or any other surviving key keeps it.
+                    if matches!(api_key, Some(AccountKeyMutation::Clear))
+                        && account_entry_is_empty(entry)
+                    {
+                        remove_account_at(doc, spec.section, address.index)?;
+                        removed.insert(address.position, RemovalCause::Emptied);
+                    }
                 }
             }
             AccountMutation::Add {
@@ -1845,7 +1955,7 @@ fn apply_key_account_mutations(
                 }
                 apply_limit_to_table(&mut table, limit)?;
                 accounts_array_mut(doc, spec.section)?.push(table);
-                live_count += 1;
+                added_count += 1;
                 // A key arriving through the form opts the vendor in,
                 // matching the plain key-card behaviour.
                 if sets_key {
@@ -1877,9 +1987,11 @@ fn apply_key_account_mutations(
                         table.remove("monthly_limit");
                     }
                 } else {
-                    let index = account_index(spec.display, label, live_count)?;
-                    remove_account_at(doc, spec.section, index)?;
-                    live_count -= 1;
+                    let address =
+                        account_index(spec.display, label, base_count, added_count, &removed)?;
+                    remove_account_at(doc, spec.section, address.index)?;
+                    // Snapshot position: see account_index.
+                    removed.insert(address.position, RemovalCause::Removed);
                 }
             }
         }
@@ -2066,6 +2178,27 @@ fn remove_account_at(doc: &mut DocumentMut, section: &str, index: usize) -> Resu
     }
     accounts.remove(index);
     Ok(())
+}
+
+/// `true` when an account table carries no information: no keys at all, or
+/// only an empty-string `api_key` (equivalent to having no key). Any other
+/// key — even with an empty value — keeps the entry.
+///
+/// ONLY ever asked about the entry a `clear` in this same request just
+/// touched, and only to decide whether the request itself emptied it. A
+/// pre-existing empty entry is the user's own placeholder (often nothing but
+/// comments), and `toml_edit` does not count comments as keys — a global
+/// sweep over this predicate would silently delete those placeholders on any
+/// unrelated save, comments and all.
+fn account_entry_is_empty(table: &toml_edit::Table) -> bool {
+    if table.is_empty() {
+        return true;
+    }
+    table.len() == 1
+        && table
+            .get("api_key")
+            .and_then(toml_edit::Item::as_str)
+            .is_some_and(str::is_empty)
 }
 
 /// `set_string` for an already-resolved table (the accounts code holds the
@@ -2471,8 +2604,20 @@ mod tests {
             {"action":"update","label":"1","api_key":{"action":"clear"}}]}}"#;
         apply_settings_json_to_path(&reloaded, patch, &path).unwrap();
         let reloaded = Config::load_from(&path).unwrap();
-        assert_eq!(reloaded.kimi.accounts[0].api_key, None);
+        // Clearing the only key empties the entry; a key account with no key
+        // and no other field is not an account, so it is dropped instead of
+        // lingering as a no-key card.
+        assert!(
+            reloaded.kimi.accounts.is_empty(),
+            "{:?}",
+            reloaded.kimi.accounts
+        );
 
+        // A fresh key re-adds position 1, and removing it leaves nothing.
+        let patch = r#"{"schema_version":1,"accounts":{"kimi":[
+            {"action":"add","api_key":{"action":"set","value":"k2"}}]}}"#;
+        apply_settings_json_to_path(&reloaded, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
         let patch = r#"{"schema_version":1,"accounts":{"kimi":[
             {"action":"remove","label":"1"}]}}"#;
         apply_settings_json_to_path(&reloaded, patch, &path).unwrap();
@@ -2529,6 +2674,297 @@ mod tests {
         let cfg = Config::load_from(&path2).unwrap();
         let zai_labels: Vec<&str> = cfg.zai.accounts.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(zai_labels, vec!["1", "2"], "{zai_labels:?}");
+    }
+
+    /// Three MiniMax accounts with fake keys k1..k3. Labels are SNAPSHOT
+    /// positions: removing "1" must not renumber "2", so both removes target
+    /// accounts that existed when the save started. The old live-count
+    /// arithmetic failed this with `does not exist (positions are 1..=1)`.
+    #[test]
+    fn remove_two_accounts_by_snapshot_position_in_one_save() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k3\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"remove","label":"1"},
+            {"action":"remove","label":"2"}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        let keys: Vec<Option<&str>> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.api_key.as_deref())
+            .collect();
+        assert_eq!(keys, vec![Some("k3")], "original 1 and 2 both removed");
+    }
+
+    /// After `remove "1"`, `update "2"` must write the account that was second
+    /// when the save STARTED (now array index 0), never the original third.
+    /// The old live-index arithmetic silently wrote the wrong account here.
+    #[test]
+    fn update_after_remove_lands_on_the_original_second_account() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k3\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"remove","label":"1"},
+            {"action":"update","label":"2","api_key":{"action":"set","value":"k2-updated"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        let keys: Vec<Option<&str>> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.api_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("k2-updated"), Some("k3")],
+            "the update rewrote original 2 and left original 3 alone"
+        );
+    }
+
+    /// Same rule one step further out: after `remove "1"`, `update "3"` names
+    /// the original third account. The old code bounded the label by the
+    /// shrunken list and rejected it (`positions are 1..=2`).
+    #[test]
+    fn update_after_remove_lands_on_the_original_third_account() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k3\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"remove","label":"1"},
+            {"action":"update","label":"3","api_key":{"action":"set","value":"k3-updated"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        let keys: Vec<Option<&str>> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.api_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("k2"), Some("k3-updated")],
+            "the update rewrote original 3 and left original 2 alone"
+        );
+    }
+
+    /// Clearing an account's key leaves a table with no fields at all. A key
+    /// account IS its key, so the save drops the entry instead of leaving an
+    /// orphan no-key card — the card users report they "cannot delete".
+    #[test]
+    fn clearing_a_key_removes_the_now_empty_account_entry() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"1","api_key":{"action":"clear"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.matches("[[minimax.accounts]]").count(),
+            1,
+            "the key-less entry left the file: {raw}"
+        );
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.minimax.accounts.len(), 1);
+        assert_eq!(reloaded.minimax.accounts[0].api_key.as_deref(), Some("k2"));
+    }
+
+    /// `api_key_env` is real information even with no inline key, so clearing
+    /// the key must KEEP the entry: the env var is still a credential.
+    #[test]
+    fn clearing_a_key_keeps_an_account_with_other_fields() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\
+                       api_key_env = \"MINIMAX_WORK_API_KEY\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"1","api_key":{"action":"clear"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.minimax.accounts.len(), 1, "env-backed entry stays");
+        assert_eq!(reloaded.minimax.accounts[0].api_key, None);
+        assert_eq!(
+            reloaded.minimax.accounts[0].api_key_env.as_deref(),
+            Some("MINIMAX_WORK_API_KEY")
+        );
+    }
+
+    /// `api_key = ""` is how a hand-edited config spells "no key", but that
+    /// entry existed BEFORE this save: the save was never asked to touch it,
+    /// so it stays byte-for-byte. Cleanup is for entries THIS request
+    /// emptied — a global sweep silently deleted the user's placeholders.
+    #[test]
+    fn pre_existing_empty_api_key_entries_survive_an_unrelated_save() {
+        let initial = "[[minimax.accounts]]\napi_key = \"\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        // Touching the vendor's list at all used to trigger the global sweep.
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.matches("[[minimax.accounts]]").count(),
+            2,
+            "a pre-existing empty entry is not this save's to delete: {raw}"
+        );
+        assert!(raw.contains("api_key = \"\""), "{raw}");
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.minimax.accounts.len(), 2);
+        assert_eq!(reloaded.minimax.accounts[0].api_key.as_deref(), Some(""));
+        assert_eq!(reloaded.minimax.accounts[1].api_key.as_deref(), Some("k2"));
+    }
+
+    /// The real-world placeholder: an account entry holding nothing but
+    /// comments. `toml_edit` does not count comments as keys, so a global
+    /// "empty entry" sweep deleted it on any unrelated save and re-parented
+    /// its comments to the end of the file. It belongs to the user.
+    #[test]
+    fn comment_only_account_placeholder_survives_an_unrelated_save() {
+        let initial = "[[minimax.accounts]]\n# api_key = \"k2\"\n# region = \"global\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k1\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.matches("[[minimax.accounts]]").count(),
+            2,
+            "the comment-only placeholder survived: {raw}"
+        );
+        // Its comments stay inside its own entry, before the next header —
+        // the old sweep left them dangling after `[ui]`.
+        let first = raw.find("[[minimax.accounts]]").unwrap();
+        let second = raw.rfind("[[minimax.accounts]]").unwrap();
+        let comment = raw.find("# region = \"global\"").unwrap();
+        assert!(raw.contains("# api_key = \"k2\""), "{raw}");
+        assert!(first < comment && comment < second, "{raw}");
+        assert!(raw.contains("api_key = \"k1\""), "real entry intact: {raw}");
+    }
+
+    /// A clear this request performs on the only inline key of an otherwise
+    /// empty entry drops that entry outright — the no-key card users report
+    /// they "cannot delete" never reaches the file.
+    #[test]
+    fn clearing_the_only_key_removes_the_entry_it_just_emptied() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"1","api_key":{"action":"clear"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[[minimax.accounts]]"), "{raw}");
+        assert!(!raw.contains("api_key"), "{raw}");
+        let reloaded = Config::load_from(&path).unwrap();
+        assert!(reloaded.minimax.accounts.is_empty());
+    }
+
+    /// One save, two different ways to leave: clear account 2's key AND
+    /// remove account 1. Both go, account 3 stays — the key-cleared entry
+    /// vacates its snapshot position exactly like the explicit remove.
+    #[test]
+    fn clearing_one_account_and_removing_another_in_one_save() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k3\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"2","api_key":{"action":"clear"}},
+            {"action":"remove","label":"1"}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        let keys: Vec<Option<&str>> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.api_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("k3")],
+            "cleared account 2 and removed account 1 both left; 3 is untouched"
+        );
+    }
+
+    /// A clear-removal occupies its snapshot position just like a remove: the
+    /// later `update "3"` lands on the account that was third when the save
+    /// STARTED, never on whichever entry slid forward.
+    #[test]
+    fn clear_removal_does_not_shift_later_labels() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k3\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"1","api_key":{"action":"clear"}},
+            {"action":"update","label":"3","api_key":{"action":"set","value":"k3-updated"}}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        let keys: Vec<Option<&str>> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.api_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("k2"), Some("k3-updated")],
+            "the update rewrote original 3, not the entry that moved up"
+        );
+    }
+
+    /// Addressing a position this same save already vacated is refused, and
+    /// the message says WHICH way it went: a key-clearing removal must not
+    /// read like the user's own `remove`.
+    #[test]
+    fn addressing_a_cleared_position_names_the_key_clear_as_the_cause() {
+        let initial = "[[minimax.accounts]]\napi_key = \"k1\"\n\n\
+                       [[minimax.accounts]]\napi_key = \"k2\"\n";
+        let (_td, path) = temp_config(Some(initial));
+        let cfg = Config::load_from(&path).unwrap();
+        let clear_then_update = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"update","label":"1","api_key":{"action":"clear"}},
+            {"action":"update","label":"1","api_key":{"action":"set","value":"k-again"}}]}}"#;
+        let cleared = apply_settings_json_to_path(&cfg, clear_then_update, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(cleared.contains("clearing its key"), "{cleared}");
+        assert!(cleared.contains("removed"), "{cleared}");
+        assert!(
+            !cleared.contains("was already removed earlier in this save"),
+            "must not reuse the explicit-remove wording: {cleared}"
+        );
+
+        // The explicit remove keeps its own wording, and the two differ.
+        let (_td2, path2) = temp_config(Some(initial));
+        let cfg2 = Config::load_from(&path2).unwrap();
+        let remove_then_update = r#"{"schema_version":1,"accounts":{"minimax":[
+            {"action":"remove","label":"1"},
+            {"action":"update","label":"1","api_key":{"action":"set","value":"k-again"}}]}}"#;
+        let removed = apply_settings_json_to_path(&cfg2, remove_then_update, &path2)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            removed.contains("was already removed earlier in this save"),
+            "{removed}"
+        );
+        assert!(!removed.contains("clearing its key"), "{removed}");
+        assert_ne!(cleared, removed);
     }
 
     /// Every key-account vendor rides the same generic bridge: adds append
@@ -2740,8 +3176,12 @@ mod tests {
             "touched entry lost its stale label: {raw}"
         );
         let reloaded = Config::load_from(&path).unwrap();
-        assert_eq!(reloaded.zai.accounts[0].api_key, None);
-        assert_eq!(reloaded.zai.accounts[1].api_key.as_deref(), Some("k2"));
+        assert_eq!(
+            reloaded.zai.accounts.len(),
+            1,
+            "the emptied entry is cleaned up; only the untouched account remains"
+        );
+        assert_eq!(reloaded.zai.accounts[0].api_key.as_deref(), Some("k2"));
     }
 
     /// The native settings form's Z.AI account list: snapshot shape, and the
@@ -2881,10 +3321,10 @@ mod tests {
         assert_eq!(recycled.zai.accounts.len(), 1);
         assert_eq!(recycled.zai.accounts[0].label, "1");
         assert_eq!(recycled.zai.accounts[0].api_key.as_deref(), Some("k2"));
-        // Two plain adds in one request are fine now — no names to collide.
+        // Two adds in one request are fine now — no names to collide.
         let dup = r#"{"schema_version":1,"accounts":{"zai":[
-            {"action":"add"},
-            {"action":"add"}]}}"#;
+            {"action":"add","api_key":{"action":"set","value":"d1"}},
+            {"action":"add","api_key":{"action":"set","value":"d2"}}]}}"#;
         let (_td4, path4) = temp_config(None);
         apply_settings_json_to_path(&Config::default(), dup, &path4).unwrap();
         let two = Config::load_from(&path4).unwrap();
@@ -2906,13 +3346,15 @@ mod tests {
         );
         assert_eq!(reset.zai.organization_id, None);
 
-        // Update the default section's fields, clear the old account, remove it.
+        // Update the default section's fields, then clear the old account's
+        // key. That entry holds nothing but the key, so the clear itself
+        // removes it — a following `remove "2"` would (correctly) be refused
+        // as already gone.
         let patch = r#"{"schema_version":1,"accounts":{"zai":[
             {"action":"update","label":"",
              "fields":{"account_type":"team","organization_id":"d-org","project_id":"d-proj"}},
             {"action":"update","label":"2",
-             "api_key":{"action":"clear"}},
-            {"action":"remove","label":"2"}]}}"#;
+             "api_key":{"action":"clear"}}]}}"#;
         apply_settings_json_to_path(&reloaded, patch, &path).unwrap();
         let reloaded = Config::load_from(&path).unwrap();
         assert_eq!(
@@ -2955,6 +3397,7 @@ mod tests {
             focus: Focus::Primary,
             primary_choices: VendorId::all().to_vec(),
             primary,
+            primary_dirty: false,
             keys: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
             limits: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
             zai: ZaiFields::default(),
@@ -3142,7 +3585,8 @@ mod tests {
         s.keys[key_index(VendorId::Kilo)].dirty = true;
         save_to_path(&s, &path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("primary = \"kilo\""));
+        // The radio was not touched, so no primary is echoed into the file.
+        assert!(!raw.contains("primary = "));
         assert!(raw.contains("[kilo]"));
         assert!(raw.contains("api_key = \"sk-kilo\""));
         assert!(raw.contains("enabled = true"));
@@ -3154,7 +3598,8 @@ mod tests {
         let s = state_with("zk", "ok", VendorId::Zai);
         save_to_path(&s, &path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("primary = \"zai\""));
+        // The radio was not moved, so the save writes keys only — no [ui].
+        assert!(!raw.contains("primary = "));
         assert!(raw.contains("[zai]"));
         assert!(raw.contains("api_key = \"zk\""));
         assert!(raw.contains("[openrouter]"));
@@ -3196,7 +3641,10 @@ api_key_env = "OPENROUTER_WORK_API_KEY"
         assert!(raw.contains("[[openrouter.accounts]]"));
         assert!(raw.contains("api_key_env = \"OPENROUTER_WORK_API_KEY\""));
         assert!(raw.contains("plan_tier = \"pro\""));
-        assert!(raw.contains("primary = \"openrouter\""));
+        // Primary untouched: the radio did not move, so the stored value is
+        // not replaced by the overlay's resolved selection.
+        assert!(raw.contains("primary = \"anthropic\""));
+        assert!(!raw.contains("primary = \"openrouter\""));
         assert!(raw.contains("api_key = \"zk2\""));
         assert!(raw.contains("api_key = \"ok2\""));
     }
@@ -3307,6 +3755,149 @@ api_key_env = "OPENROUTER_WORK_API_KEY"
         assert!(!raw.contains("primary = \"grok\""));
         // The keys still saved.
         assert!(raw.contains("zk"));
+
+        // Even an explicit radio move cannot persist a disabled primary.
+        let mut moved = state_with("zk", "ok", VendorId::Grok);
+        moved.primary_choices = vec![VendorId::Anthropic];
+        moved.primary_dirty = true;
+        let (_dir2, path2) = temp_config(Some("[ui]\nprimary = \"anthropic\"\n"));
+        save_to_path(&moved, &path2).unwrap();
+        assert!(
+            std::fs::read_to_string(&path2)
+                .unwrap()
+                .contains("primary = \"anthropic\"")
+        );
+    }
+
+    #[test]
+    fn apply_patch_without_primary_keeps_ui_primary_byte_untouched() {
+        // The regression: a pure account remove used to rewrite
+        // `[ui] primary` to the resolver's fallback, silently overriding a
+        // user-configured (here: not-yet-enabled) primary.
+        let start = r#"[ui]
+# user-chosen primary; zai is deliberately not enabled yet
+primary = "zai"
+
+[zai]
+# not usable right now, but the user's chosen primary must survive
+enabled = false
+plan_tier = "pro"
+
+[kimi]
+enabled = true
+
+[[minimax.accounts]]
+label = "1"
+api_key = "mm1"
+
+[[minimax.accounts]]
+label = "2"
+api_key = "mm2"
+"#;
+        let (_dir, path) = temp_config(Some(start));
+        let cfg = Config::load_from(&path).unwrap();
+        let patch = r#"{"schema_version":1,"keys":{},"accounts":{"minimax":[
+            {"action":"remove","label":"2"}]}}"#;
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"zai\""), "{raw}");
+        assert!(
+            raw.contains("# user-chosen primary; zai is deliberately not enabled yet"),
+            "[ui] table bytes must survive: {raw}"
+        );
+        // The remove itself still applied.
+        let reloaded = Config::load_from(&path).unwrap();
+        let labels: Vec<&str> = reloaded
+            .minimax
+            .accounts
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["1"], "{raw}");
+    }
+
+    #[test]
+    fn apply_patch_writes_primary_only_when_explicit() {
+        let start = "[ui]\nprimary = \"anthropic\"\n\n[openrouter]\nenabled = true\n";
+        let (_dir, path) = temp_config(Some(start));
+
+        // An explicit, enabled primary is persisted.
+        let patch = r#"{"schema_version":1,"primary":"openrouter","keys":{}}"#;
+        let cfg = Config::load_from(&path).unwrap();
+        apply_settings_json_to_path(&cfg, patch, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"openrouter\""), "{raw}");
+        assert_eq!(
+            Config::load_from(&path).unwrap().ui.primary,
+            Some(VendorId::Openrouter)
+        );
+
+        // An explicit but disabled primary is still refused, file unchanged.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = r#"{"schema_version":1,"primary":"grok","keys":{}}"#;
+        let error = apply_settings_json_to_path(&Config::load_from(&path).unwrap(), bad, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not enabled"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn overlay_save_does_not_echo_the_resolved_primary() {
+        // from_config resolves a disabled primary for display only; saving
+        // without touching the radio must not persist that resolved view.
+        let (_dir0, path0) = temp_config(Some(
+            "[ui]\nprimary = \"zai\"\n\n[zai]\nenabled = false\n\n[kimi]\nenabled = true\n",
+        ));
+        let cfg = Config::load_from(&path0).unwrap();
+        let mut s = SettingsState::from_config(&cfg);
+        assert!(!s.primary_dirty);
+        assert_ne!(
+            s.primary,
+            VendorId::Zai,
+            "disabled primary is only a display fallback"
+        );
+        let kimi = key_index(VendorId::Kimi);
+        s.keys[kimi] = KeyInput::from_config(Some("kk"));
+        s.keys[kimi].dirty = true;
+
+        // An existing [ui] primary survives byte-for-byte.
+        let (_dir, path) = temp_config(Some("[ui]\nprimary = \"zai\"\n"));
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"zai\""), "{raw}");
+        assert!(
+            !raw.contains(&format!("primary = \"{}\"", s.primary.slug())),
+            "resolved fallback must not be echoed: {raw}"
+        );
+        assert!(raw.contains("api_key = \"kk\""), "{raw}");
+
+        // A fresh file gains the key but no invented [ui] table.
+        let (_dir2, path2) = temp_config(None);
+        save_to_path(&s, &path2).unwrap();
+        let raw2 = std::fs::read_to_string(&path2).unwrap();
+        assert!(!raw2.contains("[ui]"), "{raw2}");
+        assert!(raw2.contains("api_key = \"kk\""), "{raw2}");
+    }
+
+    #[test]
+    fn overlay_save_writes_primary_after_radio_switch() {
+        let (_dir, path) = temp_config(Some(
+            "[kimi]\nenabled = true\n\n[openrouter]\nenabled = true\n",
+        ));
+        let mut s = SettingsState::from_config(&Config::load_from(&path).unwrap());
+        assert!(!s.primary_dirty);
+        let before = s.primary;
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert!(s.primary_dirty, "a real radio move arms the primary write");
+        assert_ne!(s.primary, before, "the move must land on another vendor");
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(&format!("primary = \"{}\"", s.primary.slug())),
+            "{raw}"
+        );
     }
 
     #[test]
@@ -3533,6 +4124,10 @@ api_key_env = "OPENROUTER_WORK_API_KEY"
 
         let state = state_from_apply_request(&cfg, &request.to_string()).unwrap();
         assert_eq!(state.primary, original_primary);
+        assert!(
+            !state.primary_dirty,
+            "absent primary field must not arm a write"
+        );
         let kimi_index = KEY_VENDORS
             .iter()
             .position(|vendor| vendor.id == VendorId::Kimi)

@@ -278,9 +278,19 @@ A patch carries an optional `primary` vendor slug and a `keys` map; each key
 entry is `{"action":"set","value":…}`, `{"action":"clear"}`, or
 `{"action":"fields","fields":{…}}` for vendor-specific values (Z.AI team ids,
 monthly limits). Saving a non-empty key also sets that vendor's
-`enabled = true`, exactly like the TUI overlay. This is the protocol the
-Omarchy settings form speaks; it edits the same `config.toml` documented
-above, through the same `toml_edit` path.
+`enabled = true`, exactly like the TUI overlay.
+
+An optional `accounts` map carries per-vendor account mutations:
+`{"action":"add"}` (appends), `{"action":"update","label":"2",…}`, and
+`{"action":"remove","label":"2"}`. `label` is the account's 1-based position
+in the list **as it was when the save started** (`""` is the vendor's default
+card), so one patch may remove "1" and still edit "2" without the edit landing
+on the wrong account; entries a patch appends sit behind every original
+position. Clearing an account's key drops the entry when nothing else is left
+in it — for the key vendors an account is its key — while entries that still
+hold something (`api_key_env`, `monthly_limit`, Z.AI billing fields) survive.
+This is the protocol the Omarchy settings form speaks; it edits the same
+`config.toml` documented above, through the same `toml_edit` path.
 
 ## Quick start
 

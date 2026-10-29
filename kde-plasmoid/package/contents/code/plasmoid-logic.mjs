@@ -155,6 +155,10 @@ export function safeText(value, maxLength = 400) {
 }
 
 function finitePercent(value) {
+    // `Number(null)` is 0 — a null percent (balance-row headline) would clamp
+    // to 0 and read as 100% remaining. Absent means absent.
+    if (value === null || value === undefined || value === '')
+        return null;
     const n = Number(value);
     return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null;
 }
@@ -405,12 +409,6 @@ export function headline(entry) {
         severity: 'low',
         label: '',
     };
-}
-
-export function isAlarming(entry) {
-    if (!entry)
-        return false;
-    return entry.status === 'error' || entry.stale === true || headline(entry).severity === 'critical';
 }
 
 // The metric rows the popup renders, spacers dropped: Column spacing handles

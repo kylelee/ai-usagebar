@@ -137,10 +137,12 @@ BarWidget {
   // One part per tile — the vendor LOGO (plus a named account's suffix),
   // or a Text fallback when no asset ships / the report predates the field.
   // Each window figure keeps its own Text with its own remaining-band
-  // color; no shared rich-text label whose spans can be dropped wholesale.
+  // color, and each ↺ countdown its own clock-band color; no shared
+  // rich-text label whose spans can be dropped wholesale.
   // Tile boundaries (the │ separators) carry almost no padding — the
   // divider glyph has whitespace of its own — while intra-tile gaps
-  // (sep > tag > figure) keep tiles reading as groups.
+  // (sep > tag > figure) keep tiles reading as groups; a countdown glues
+  // to its percentage with no pad at all.
   // Items don't take the pointer, so hover, click and wheel keep reaching
   // the WidgetButton underneath.
   Row {
@@ -165,8 +167,7 @@ BarWidget {
         readonly property string textWhenNoLogo: String(modelData.text || "")
         readonly property int leftPad: role === "sep" ? 2
           : role === "tag" ? 6
-          : role === "figure" ? 4 : 0
-        readonly property int rightPad: role === "sep" ? 2 : 0
+          : role === "figure" ? 4 : 0 // countdown glues at 0 pad
         // The text beside a logo is the account suffix (named accounts
         // only); without a logo the full tag text stands in.
         readonly property string text: showLogo ? logoLabel : textWhenNoLogo

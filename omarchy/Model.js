@@ -29,6 +29,9 @@ function autoTextSafe(value) {
 }
 
 function finitePercent(value) {
+  // `Number(null)` is 0 — a null percent (balance-row headline) would clamp
+  // to 0 and read as 100% remaining. Absent means absent.
+  if (value === null || value === undefined || value === "") return null
   var number = Number(value)
   if (!isFinite(number)) return null
   return Math.max(0, Math.min(100, Math.round(number)))
@@ -46,6 +49,12 @@ function normalizeSection(raw) {
       severity = percent >= 90 ? "critical" : percent >= 75 ? "high" : percent >= 50 ? "mid" : "low"
     var window = raw.window === "session" || raw.window === "weekly"
       ? raw.window : null
+    // The window's length in seconds (Rust-owned). With reset_at it feeds
+    // the countdown figure's own clock band; null on older binaries and
+    // rows without a window.
+    var rawWindowSeconds = Number(raw.window_seconds)
+    var windowSeconds = isFinite(rawWindowSeconds) && rawWindowSeconds > 0
+      ? rawWindowSeconds : null
     return {
       type: "metric",
       label: cleanText(raw.label, 160),
@@ -54,7 +63,8 @@ function normalizeSection(raw) {
       detail: cleanText(raw.detail, 1000),
       severity: severity,
       reset_at: cleanText(raw.reset_at, 80),
-      window: window
+      window: window,
+      window_seconds: windowSeconds
     }
   }
   if (type === "text") {
@@ -160,16 +170,6 @@ function providerName(entry) {
   return autoTextSafe(title)
 }
 
-// The Waybar-style provider tag. `VendorId::short_name` in Rust owns the codes
-// and ships them as `short_name`; a binary older than that field has none, so
-// the machine id's vendor half stands in rather than a table living here.
-function providerShort(entry) {
-  if (!entry) return ""
-  var code = cleanText(entry.short_name, 24).trim()
-  if (code === "") code = baseProvider(entry.id).replace(/_/g, "-")
-  return autoTextSafe(code).trim()
-}
-
 function filteredEntries(entries, configuredProvider) {
   var list = Array.isArray(entries) ? entries : []
   var wanted = String(configuredProvider || "").trim().toLowerCase()
@@ -263,38 +263,12 @@ function settingsWithOverrides(settings, moduleName, overrides) {
   return next
 }
 
-function settingsWithSelectedEntry(settings, moduleName, entryId) {
-  var selected = cleanText(entryId, 180).trim()
-  if (selected === "") return null
-  return settingsWithOverrides(settings, moduleName, { lastSelectedEntryId: selected })
-}
-
 function booleanSetting(value, fallback) {
   if (value === true || value === false) return value
   var normalized = String(value === undefined || value === null ? "" : value).trim().toLowerCase()
   if (["true", "1", "yes", "on"].indexOf(normalized) >= 0) return true
   if (["false", "0", "no", "off"].indexOf(normalized) >= 0) return false
   return fallback === true
-}
-
-// `providerLabel` is already resolved by the caller: empty when the opt-in
-// provider switch is off, so the icon-and-value label is unchanged for everyone
-// who never turns it on. A vertical bar has no width for either field and
-// keeps showing the icon alone. The robot glyph never swaps to an alert
-// mark — alarms travel through the renderer's color, not the glyph.
-function barLabel(alarming, vertical, showValue, loading, hasEntry, summaryText,
-                  providerLabel) {
-  var icon = "󰚩"
-  if (vertical) return icon
-  if (loading && !hasEntry) return icon + "  …"
-  if (!hasEntry) return icon
-  var provider = autoTextSafe(providerLabel).trim()
-  var summary = showValue ? autoTextSafe(summaryText).trim() : ""
-  if (provider === "") return summary === "" ? icon : icon + "  " + summary
-  // One space between tag and value, matching Waybar's
-  // `{vendor_short} {session_pct}%`; the wider gap stays next to the icon.
-  return summary === "" ? icon + "  " + provider
-    : icon + "  " + provider + " " + summary
 }
 
 // The per-account tag of a bar tile. A named account shows its own name
@@ -392,6 +366,21 @@ function compactReset(resetAt, nowMs) {
   return frac === 0 ? whole + suffix : whole + "." + frac + suffix
 }
 
+// The countdown figure's own class: what fraction of the window's TIME is
+// still on the clock — 1h left of a 5h window reads as 20%, 1.1d of 7d as
+// 15.7% — banded by the same remaining scale the percentage figures use, so
+// the clock's color escalates on its own, independent of the usage percent
+// beside it. `remainingClass` expects a utilization percent; the fraction
+// here is itself the REMAINING side, so it goes in as the complement.
+function countdownClass(resetAt, windowSeconds, nowMs) {
+  if (!resetAt || !windowSeconds) return ""
+  var resetMs = new Date(String(resetAt)).getTime()
+  if (!isFinite(resetMs)) return ""
+  var secs = (resetMs - Number(nowMs)) / 1000
+  if (!isFinite(secs)) return ""
+  return remainingClass(100 - secs / Number(windowSeconds) * 100)
+}
+
 // The two windows a tile leads with: the rolling ~5h session and the weekly
 // quota. The classification is Rust-owned (`window` on each metric row);
 // this only picks the rows, so the rule can never fork between frontends.
@@ -428,11 +417,12 @@ function providerEntryCounts(entries) {
 }
 
 // One account's tile as separabler parts: the tag first (NEUTRAL — the tag
-// keeps the theme foreground color, never a usage range), then one part per
-// shown figure carrying its OWN class, so the 5h and weekly windows render
-// as independent Text objects with independent conditions: a green 5h
-// figure ("99% left") can sit beside an orange weekly one ("13% left")
-// instead of the whole key sharing a single color — and vice versa.
+// keeps the theme foreground color, never a usage range), then per shown
+// window TWO parts carrying their OWN classes — the percentage and its
+// countdown render as independent Text objects with independent colors: a
+// green 5h figure ("99% left") can sit beside an orange weekly one ("13%
+// left"), and each countdown colors by how much of the window's CLOCK is
+// left rather than by its usage percent.
 //
 // The tag part also carries the vendor logo asset id (`logo`). Beside a
 // rendered logo only a NAMED account still needs its distinguishing text
@@ -470,11 +460,18 @@ function tileParts(entry, showValue, showRemaining, nowMs, solo) {
       var metric = windows[i]
       var pct = showRemaining ? 100 - metric.percent : metric.percent
       // A window without a countdown (not started yet) keeps its slot with
-      // a dash placeholder — `0%·-` lines up with `38%·2h` instead of
-      // looking like the timer failed to load.
+      // a dash placeholder — `0%↺-` lines up with `38%↺2h` instead of
+      // looking like the timer failed to load. The ↺ glyph marks the figure
+      // as the reset countdown; `glue` keeps it flush against its percent
+      // (no space in the joined label, no pad as its own Text part).
       var reset = compactReset(metric.reset_at, nowMs)
       if (reset === "") reset = "-"
-      parts.push({ text: pct + "%·" + reset, cls: windowClass(metric) })
+      parts.push({ text: pct + "%", cls: windowClass(metric) })
+      parts.push({
+        text: "↺" + reset,
+        cls: countdownClass(metric.reset_at, metric.window_seconds, nowMs),
+        glue: true
+      })
     }
     return parts
   }
@@ -494,8 +491,12 @@ function tileParts(entry, showValue, showRemaining, nowMs, solo) {
 function tileLabel(entry, showValue, showRemaining, nowMs, solo) {
   var parts = tileParts(entry, showValue, showRemaining, nowMs, solo)
   var texts = []
-  for (var i = 0; i < parts.length; i++) texts.push(parts[i].text)
-  return texts.join(" ")
+  for (var i = 0; i < parts.length; i++) {
+    // Glued parts (the ↺ countdowns) sit flush against their percentage.
+    if (i > 0 && parts[i].glue !== true) texts.push(" ")
+    texts.push(parts[i].text)
+  }
+  return texts.join("")
 }
 
 // The tiled bar: every WORKING, non-exhausted account side by side, the

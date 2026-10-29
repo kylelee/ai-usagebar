@@ -29,9 +29,19 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-UUID="ai-usagebar-omarchy@kylelee.github.io"
+UUID="ai-usagebar@kylelee.github.io"
 SRC="$REPO/gnome-extension"
 DEST="$HOME/.local/share/gnome-shell/extensions/$UUID"
+
+# The uuid was renamed from ai-usagebar-omarchy@… — retire any install left
+# under the old id so the shell never loads two copies of the extension.
+OLD_UUID="ai-usagebar-omarchy@kylelee.github.io"
+OLD_DEST="$HOME/.local/share/gnome-shell/extensions/$OLD_UUID"
+if [[ -d $OLD_DEST ]]; then
+    gnome-extensions disable "$OLD_UUID" 2>/dev/null || true
+    rm -rf "$OLD_DEST"
+    echo "› Removed old install $OLD_UUID"
+fi
 
 # 1. The binaries the extension spawns.
 "$REPO/scripts/install-bin.sh"

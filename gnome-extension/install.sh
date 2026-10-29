@@ -6,9 +6,19 @@
 # checkout moves or is deleted — re-run the script to redeploy changes.
 set -euo pipefail
 
-UUID="ai-usagebar-omarchy@kylelee.github.io"
+UUID="ai-usagebar@kylelee.github.io"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="$HOME/.local/share/gnome-shell/extensions/$UUID"
+
+# The uuid was renamed from ai-usagebar-omarchy@… — retire any install left
+# under the old id so the shell never loads two copies of the extension.
+OLD_UUID="ai-usagebar-omarchy@kylelee.github.io"
+OLD_DEST="$HOME/.local/share/gnome-shell/extensions/$OLD_UUID"
+if [[ -d $OLD_DEST ]]; then
+    gnome-extensions disable "$OLD_UUID" 2>/dev/null || true
+    rm -rf "$OLD_DEST"
+    echo "› Removed old install $OLD_UUID"
+fi
 
 echo "› Compiling schema…"
 glib-compile-schemas "$SRC/schemas"

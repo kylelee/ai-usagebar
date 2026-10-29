@@ -37,7 +37,6 @@ import {
     filteredEntries,
     formatReset,
     formatUpdated,
-    isAlarming,
     launchErrorMessage,
     logoAssetName,
     metricDetail,
@@ -45,11 +44,12 @@ import {
     preferredEntryId,
     providerEntryCounts,
     providerName,
+    robotAlarmClass,
     selectedIndex,
+    tileAlarmClass,
     tileParts,
     tileTag,
     windowClass,
-    worstBand,
 } from './report-model.js';
 
 const ROLE = 'ai-usagebar';
@@ -206,9 +206,16 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._tileBox.add_style_class_name('aiub-tile-plate');
         else
             this._tileBox.remove_style_class_name('aiub-tile-plate');
-        const alarmClass = this._alarming(visible) ? 'aiub-alarm' : '';
         if (!tiledMode) {
-            this._robotLabel.style_class = ('aiub-tile-label ' + alarmClass).trim();
+            // The robot label speaks for the account it would show (or for
+            // the load itself) — never for another vendor's urgency.
+            const filterMiss = this._report !== null && visible.length === 0
+                && this._settings.get_string('vendor') !== ''
+                && this._report.entries.length > 0;
+            const shown = tiles.length > 0 ? tiles[0] : null;
+            this._robotLabel.style_class =
+                ('aiub-tile-label ' + robotAlarmClass(this._reportError, filterMiss, shown))
+                    .trim();
             return;
         }
         // Actor churn only when the tile set (or the logo policy) changes;
@@ -220,7 +227,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._buildTiles(tiles, showLogos);
             this._tileKey = key;
         }
-        this._updateTileMarkup(tiles, visible, alarmClass);
+        this._updateTileMarkup(tiles, visible);
     }
 
     // One tile = optional logo icon + ONE label whose Pango markup carries
@@ -253,11 +260,13 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
     // The label markup of one tile: the tag stays neutral (theme foreground,
     // inherited from the label), each figure gets a span in its OWN window's
-    // remaining-band color read live from the color-* keys, and a critical
-    // figure also goes bold so the alert survives color blindness. tileParts
-    // text is pre-escaped by the adapter (autoTextSafe); only '&' — the one
-    // character it does not neutralize — is encoded here, never re-escaped
-    // wholesale (that would show literal entities).
+    // remaining-band color and its ↺ countdown a span in that window's CLOCK
+    // band (both read live from the color-* keys), and a critical part also
+    // goes bold so the alert survives color blindness. tileParts text is
+    // pre-escaped by the adapter (autoTextSafe); only '&' — the one character
+    // it does not neutralize — is encoded here, never re-escaped wholesale
+    // (that would show literal entities). Glued parts append flush to the
+    // previous segment — the countdown never gains a space before ↺.
     _tileMarkup(entry, solo) {
         const parts = tileParts(entry, true,
             this._settings.get_boolean('show-remaining'), this._nowMs, solo);
@@ -277,7 +286,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             const safe = text.replace(/&/g, '&amp;');
             const body = part.cls === 'critical' ? `<b>${safe}</b>` : safe;
             const hex = this._bandColor(part.cls);
-            segments.push(hex !== '' ? `<span foreground="${hex}">${body}</span>` : body);
+            const span = hex !== '' ? `<span foreground="${hex}">${body}</span>` : body;
+            if (part.glue === true && segments.length > 0)
+                segments[segments.length - 1] += span;
+            else
+                segments.push(span);
         }
         return segments.join(' ');
     }
@@ -293,34 +306,19 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     // In-place markup refresh: same actors, new figures/colors/countdowns.
-    _updateTileMarkup(tiles, visible, alarmClass) {
+    _updateTileMarkup(tiles, visible) {
         const counts = providerEntryCounts(visible);
         for (let i = 0; i < this._tiles.length && i < tiles.length; i++) {
             const entry = tiles[i];
             const solo = counts[baseProvider(entry.id)] <= 1;
             const label = this._tiles[i].label;
             label.clutter_text.set_markup(this._tileMarkup(entry, solo));
-            label.style_class = ('aiub-tile-label ' + alarmClass).trim();
+            // Alarm isolation: only THIS account's own urgent state (error,
+            // stale, critical) reddens its neutral tag. Another vendor's
+            // critical headline must never bleed into this tile — the
+            // figure spans above always keep their own band colors.
+            label.style_class = ('aiub-tile-label ' + tileAlarmClass(entry)).trim();
         }
-    }
-
-    // Urgent states: a refresh failure, a vendor filter matching nothing, or
-    // any shown account broken, stale, or critical (worst band included).
-    // Colors the bar text through .aiub-alarm — explicit figure spans keep
-    // their own colors, so only the neutral tag/ellipsis inherits the red.
-    _alarming(visible) {
-        if (this._reportError !== '')
-            return true;
-        if (this._report && visible.length === 0
-                && this._settings.get_string('vendor') !== ''
-                && this._report.entries.length > 0)
-            return true;
-        if (worstBand(visible) === 'critical')
-            return true;
-        for (const entry of visible)
-            if (isAlarming(entry))
-                return true;
-        return false;
     }
 
     _onScroll(event) {

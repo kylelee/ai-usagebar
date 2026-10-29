@@ -323,12 +323,15 @@ Panel {
       var parts = Model.tileParts(working[w], true, showRemaining, nowMs, solo)
       if (parts.length === 0) continue
       if (items.length > 0) push("│", root.dim, "sep")
-      // The tag part is always neutral (theme foreground); only the window
-      // figures carry their own remaining-band class — critical ones also
-      // go bold so the alert survives color blindness.
+      // The tag part is always neutral (theme foreground); the window
+      // figures carry their own remaining-band class and their ↺ countdowns
+      // their own clock-band class — critical ones also go bold so the
+      // alert survives color blindness. Glued parts render as "countdown"
+      // (no left pad — flush against their percentage).
       for (var p = 0; p < parts.length; p++)
         push(parts[p].text, root.bandColor(parts[p].cls),
-          p === 0 ? "tag" : "figure", parts[p].cls === "critical",
+          p === 0 ? "tag" : (parts[p].glue === true ? "countdown" : "figure"),
+          parts[p].cls === "critical",
           false, parts[p].logo, parts[p].logoLabel)
     }
     return items

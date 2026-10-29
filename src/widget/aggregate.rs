@@ -108,6 +108,9 @@ impl AggregateEntry {
                     section,
                     reset_at,
                     window,
+                    // The Waybar popup renders no per-countdown band; the
+                    // report JSON is the field's consumer.
+                    window_seconds: _,
                 } = projected;
                 match section {
                     Section::Metric {
@@ -469,7 +472,7 @@ fn render_tooltip(entries: &[AggregateEntry], theme: &Theme, now: DateTime<Utc>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::{UsageWindow, ZaiSnapshot};
+    use crate::usage::{MinimaxSnapshot, UsageWindow, ZaiSnapshot};
     use crate::vendor::VendorId;
 
     fn window(pct: i32) -> UsageWindow {
@@ -826,5 +829,89 @@ mod tests {
         let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
         assert_eq!(text, "󰚩");
         assert!(!text.contains("⚠"), "{text}");
+    }
+
+    /// U10: MiniMax tiles both text-pool windows (`Session (5h)` + `Weekly`)
+    /// with their own resets, mirroring `tiles_carry_both_windows_with_their_resets`
+    /// for Z.AI. Video rows follow in the popup but never become tile
+    /// figures.
+    fn minimax_state(session_pct: i32, weekly_pct: i32) -> TabState {
+        let session = UsageWindow {
+            utilization_pct: session_pct,
+            resets_at: None,
+            window_duration: chrono::Duration::hours(5),
+        };
+        let weekly = UsageWindow {
+            utilization_pct: weekly_pct,
+            resets_at: None,
+            window_duration: chrono::Duration::days(7),
+        };
+        TabState::Ready(Box::new(crate::tui::app::ReadyTab {
+            snapshot: crate::usage::VendorSnapshot::Minimax(MinimaxSnapshot {
+                plan: "MiniMax Pro".into(),
+                session,
+                weekly,
+                video_session: Some(UsageWindow {
+                    utilization_pct: 30,
+                    resets_at: None,
+                    window_duration: chrono::Duration::hours(24),
+                }),
+                video_weekly: Some(UsageWindow {
+                    utilization_pct: 35,
+                    resets_at: None,
+                    window_duration: chrono::Duration::days(7),
+                }),
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: None,
+        }))
+    }
+
+    #[test]
+    fn minimax_tile_carries_both_text_windows_with_resets_and_skips_video() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        let mut state = minimax_state(25, 40);
+        let TabState::Ready(ready) = &mut state else {
+            unreachable!()
+        };
+        if let crate::usage::VendorSnapshot::Minimax(snap) = &mut ready.snapshot {
+            snap.session.resets_at =
+                Some(now + chrono::Duration::hours(2) + chrono::Duration::minutes(5));
+            snap.weekly.resets_at =
+                Some(now + chrono::Duration::days(2) + chrono::Duration::hours(3));
+        }
+        let entries = vec![AggregateEntry::from_tab(
+            &TabId::vendor(VendorId::Minimax),
+            &state,
+            now,
+        )];
+        let text = render_bar_text(&entries, &Theme::default(), &opts(), now);
+        // Two text windows tile in zai order: 5h first, then weekly.
+        assert!(text.contains("25%·2h"), "{text}");
+        assert!(text.contains("40%·2.1d"), "{text}");
+        // Video rows never become tile figures (window=null): the 30/35
+        // numbers from the video rows must not appear on the bar.
+        assert!(
+            !text.contains("30%"),
+            "video (5h) leaked onto the bar: {text}"
+        );
+        assert!(
+            !text.contains("35%"),
+            "video weekly leaked onto the bar: {text}"
+        );
+        // The popup keeps the video rows for context — they remain on
+        // entry.sections but never reach the bar.
+        let entry = &entries[0];
+        let labels: Vec<&str> = entry
+            .sections
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Session (5h)"), "popup lost Session (5h)");
+        assert!(labels.contains(&"Weekly"), "popup lost Weekly");
+        assert!(labels.contains(&"Video (5h)"), "popup lost Video (5h)");
+        assert!(labels.contains(&"Video weekly"), "popup lost Video weekly");
     }
 }

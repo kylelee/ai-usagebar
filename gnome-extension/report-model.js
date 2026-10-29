@@ -33,6 +33,9 @@ export function autoTextSafe(value) {
 }
 
 export function finitePercent(value) {
+    // `Number(null)` is 0 — a null percent (balance-row headline) would clamp
+    // to 0 and read as 100% remaining. Absent means absent.
+    if (value === null || value === undefined || value === '') return null;
     const number = Number(value);
     if (!isFinite(number)) return null;
     return Math.max(0, Math.min(100, Math.round(number)));
@@ -51,6 +54,12 @@ export function normalizeSection(raw) {
                 : percent >= 50 ? 'mid' : 'low';
         const window = raw.window === 'session' || raw.window === 'weekly'
             ? raw.window : null;
+        // The window's length in seconds (Rust-owned). With reset_at it feeds
+        // the countdown figure's own clock band; null on older binaries and
+        // rows without a window.
+        const rawWindowSeconds = Number(raw.window_seconds);
+        const windowSeconds = isFinite(rawWindowSeconds) && rawWindowSeconds > 0
+            ? rawWindowSeconds : null;
         return {
             type: 'metric',
             label: cleanText(raw.label, 160),
@@ -59,7 +68,8 @@ export function normalizeSection(raw) {
             detail: cleanText(raw.detail, 1000),
             severity: severity,
             reset_at: cleanText(raw.reset_at, 80),
-            window: window
+            window: window,
+            window_seconds: windowSeconds
         };
     }
     if (type === 'text') {
@@ -165,16 +175,6 @@ export function providerName(entry) {
     return autoTextSafe(title);
 }
 
-// The Waybar-style provider tag. `VendorId::short_name` in Rust owns the codes
-// and ships them as `short_name`; a binary older than that field has none, so
-// the machine id's vendor half stands in rather than a table living here.
-export function providerShort(entry) {
-    if (!entry) return '';
-    let code = cleanText(entry.short_name, 24).trim();
-    if (code === '') code = baseProvider(entry.id).replace(/_/g, '-');
-    return autoTextSafe(code).trim();
-}
-
 export function filteredEntries(entries, configuredProvider) {
     const list = Array.isArray(entries) ? entries : [];
     const wanted = String(configuredProvider || '').trim().toLowerCase();
@@ -274,60 +274,6 @@ export function preferredEntryId(entries, primaryProvider, rememberedEntryId) {
     return list[0].id;
 }
 
-export function settingsWithOverrides(settings, moduleName, overrides) {
-    const moduleId = cleanText(moduleName, 180).trim();
-    if (moduleId === '' || !overrides || typeof overrides !== 'object' || Array.isArray(overrides))
-        return null;
-
-    const next = {id: moduleId};
-    const current = settings && typeof settings === 'object' && !Array.isArray(settings)
-        ? settings : {};
-    for (const key in current) {
-        if (key === 'id' || key === '__proto__' || key === 'constructor' || key === 'prototype')
-            continue;
-        next[key] = current[key];
-    }
-    for (const overrideKey in overrides) {
-        if (overrideKey === 'id' || overrideKey === '__proto__' || overrideKey === 'constructor'
-            || overrideKey === 'prototype') continue;
-        next[overrideKey] = overrides[overrideKey];
-    }
-    return next;
-}
-
-export function settingsWithSelectedEntry(settings, moduleName, entryId) {
-    const selected = cleanText(entryId, 180).trim();
-    if (selected === '') return null;
-    return settingsWithOverrides(settings, moduleName, {lastSelectedEntryId: selected});
-}
-
-export function booleanSetting(value, fallback) {
-    if (value === true || value === false) return value;
-    const normalized = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
-    if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
-    if (['false', '0', 'no', 'off'].includes(normalized)) return false;
-    return fallback === true;
-}
-
-// `providerLabel` is already resolved by the caller: empty when the opt-in
-// provider switch is off. A vertical bar has no width for either field and
-// keeps showing the icon alone. The robot glyph never swaps to an alert mark —
-// alarms travel through the renderer's color, not the glyph.
-export function barLabel(alarming, vertical, showValue, loading, hasEntry, summaryText,
-    providerLabel) {
-    const icon = '󰚩';
-    if (vertical) return icon;
-    if (loading && !hasEntry) return icon + '  …';
-    if (!hasEntry) return icon;
-    const provider = autoTextSafe(providerLabel).trim();
-    const summary = showValue ? autoTextSafe(summaryText).trim() : '';
-    if (provider === '') return summary === '' ? icon : icon + '  ' + summary;
-    // One space between tag and value, matching Waybar's
-    // `{vendor_short} {session_pct}%`; the wider gap stays next to the icon.
-    return summary === '' ? icon + '  ' + provider
-        : icon + '  ' + provider + ' ' + summary;
-}
-
 // The per-account tag of a bar tile. A named account shows its own name ONLY
 // (kimi-main 37% — the provider stays in the popup); an unnamed default
 // account shows the provider name (kimi 37%), taken from the report id the
@@ -384,21 +330,6 @@ export function tileRemainingClass(entry) {
     return worst;
 }
 
-// The worst band across a list of entries — READY entries only (a broken
-// account already flips the bar icon urgent; the dot is usage, not alerts).
-export function worstBand(entries) {
-    const rank = {low: 0, mid: 1, high: 2, critical: 3};
-    let worst = '';
-    const list = Array.isArray(entries) ? entries : [];
-    for (let i = 0; i < list.length; i++) {
-        if (list[i].status !== 'ready') continue;
-        const cls = tileRemainingClass(list[i]);
-        if (cls === '') continue;
-        if (worst === '' || rank[cls] > rank[worst]) worst = cls;
-    }
-    return worst;
-}
-
 // One-unit bar-tile countdown, mirroring Rust's `countdown::format_compact`:
 //   under an hour  → 42m  (whole minutes, rounded up; capped at 59m)
 //   under a day    → 5.3h (tenths of an hour; "5h" when the tenth is zero)
@@ -420,6 +351,21 @@ export function compactReset(resetAt, nowMs) {
     const whole = Math.floor(tenths / 10);
     const frac = tenths % 10;
     return frac === 0 ? whole + suffix : whole + '.' + frac + suffix;
+}
+
+// The countdown figure's own class: what fraction of the window's TIME is
+// still on the clock — 1h left of a 5h window reads as 20%, 1.1d of 7d as
+// 15.7% — banded by the same remaining scale the percentage figures use, so
+// the clock's color escalates on its own, independent of the usage percent
+// beside it. `remainingClass` expects a utilization percent; the fraction
+// here is itself the REMAINING side, so it goes in as the complement.
+export function countdownClass(resetAt, windowSeconds, nowMs) {
+    if (!resetAt || !windowSeconds) return '';
+    const resetMs = new Date(String(resetAt)).getTime();
+    if (!isFinite(resetMs)) return '';
+    const secs = (resetMs - Number(nowMs)) / 1000;
+    if (!isFinite(secs)) return '';
+    return remainingClass(100 - secs / Number(windowSeconds) * 100);
 }
 
 // The two windows a tile leads with: the rolling ~5h session and the weekly
@@ -458,12 +404,13 @@ export function providerEntryCounts(entries) {
 }
 
 // One account's tile as separable parts: the tag first (NEUTRAL — the tag
-// keeps the theme foreground color, never a usage range), then one part per
-// shown figure carrying its OWN class, so the 5h and weekly windows render as
-// independent label objects with independent conditions: a green 5h figure
-// ("99% left") can sit beside an orange weekly one ("13% left") instead of the
-// whole key sharing a single color — and vice versa. Critical-bold is NOT
-// baked in: `cls === "critical"` is consumed at the render site.
+// keeps the theme foreground color, never a usage range), then per shown
+// window TWO parts carrying their OWN classes — the percentage and its
+// countdown render as independent spans with independent colors: a green 5h
+// figure ("99% left") can sit beside an orange weekly one ("13% left"), and
+// each countdown colors by how much of the window's CLOCK is left rather
+// than by its usage percent. Critical-bold is NOT baked in: `cls ===
+// "critical"` is consumed at the render site.
 //
 // The tag part also carries the vendor logo asset id (`logo`). Beside a
 // rendered logo only a NAMED account still needs its distinguishing text
@@ -500,11 +447,18 @@ export function tileParts(entry, showValue, showRemaining, nowMs, solo) {
             const metric = windows[i];
             const pct = showRemaining ? 100 - metric.percent : metric.percent;
             // A window without a countdown (not started yet) keeps its slot
-            // with a dash placeholder — `0%·-` lines up with `38%·2h` instead
-            // of looking like the timer failed to load.
+            // with a dash placeholder — `0%↺-` lines up with `38%↺2h` instead
+            // of looking like the timer failed to load. The ↺ glyph marks the
+            // figure as the reset countdown; `glue` keeps it flush against
+            // its percent (no space at the render site).
             let reset = compactReset(metric.reset_at, nowMs);
             if (reset === '') reset = '-';
-            parts.push({text: pct + '%·' + reset, cls: windowClass(metric)});
+            parts.push({text: pct + '%', cls: windowClass(metric)});
+            parts.push({
+                text: '↺' + reset,
+                cls: countdownClass(metric.reset_at, metric.window_seconds, nowMs),
+                glue: true
+            });
         }
         return parts;
     }
@@ -517,42 +471,6 @@ export function tileParts(entry, showValue, showRemaining, nowMs, solo) {
     if (tagPart) parts.push(tagPart);
     parts.push({text: text, cls: tileRemainingClass(entry)});
     return parts;
-}
-
-// The same tile as one plain string — the joined form of `tileParts` for
-// single-label consumers (`tiledBarLabel`).
-export function tileLabel(entry, showValue, showRemaining, nowMs, solo) {
-    const parts = tileParts(entry, showValue, showRemaining, nowMs, solo);
-    const texts = [];
-    for (let i = 0; i < parts.length; i++) texts.push(parts[i].text);
-    return texts.join(' ');
-}
-
-// The tiled bar: every WORKING, non-exhausted account side by side, and NO
-// module icon in front — every tile leads with its vendor logo, so the robot
-// would be pure redundancy (single-account mode is the one that is icon-only).
-// The separator carries no padding spaces — the divider glyph has whitespace
-// of its own. Misconfigured entries (no key, broken config) and exhausted ones
-// (every window maxed, balance spent) stay off the bar — the click popup keeps
-// their rows and remedies. The robot glyph never swaps to an alert mark; the
-// rendered bar signals alarms by COLOR.
-export function tiledBarLabel(alarming, vertical, showValue, loading, entries,
-    showRemaining, nowMs) {
-    const icon = '󰚩';
-    const all = Array.isArray(entries) ? entries : [];
-    const working = barEntries(all);
-    if (vertical) return icon;
-    if (all.length === 0) return loading ? icon + '  …' : icon;
-    if (working.length === 0) return icon;
-    const counts = providerEntryCounts(all);
-    const parts = [];
-    for (let i = 0; i < working.length; i++) {
-        const solo = counts[baseProvider(working[i].id)] <= 1;
-        const tile = tileLabel(working[i], showValue, showRemaining, nowMs, solo);
-        if (tile !== '') parts.push(tile);
-    }
-    if (parts.length === 0) return icon;
-    return parts.join('│');
 }
 
 export function headline(entry) {
@@ -600,6 +518,25 @@ export function isAlarming(entry) {
     if (entry.status === 'unconfigured') return false;
     const summary = headline(entry);
     return entry.status === 'error' || entry.stale === true || summary.severity === 'critical';
+}
+
+// The alarm class ONE bar tile's neutral text carries: only its OWN
+// account's urgent state (error, stale, critical headline) — never another
+// vendor's. Before this, any critical account (kimi's maxed 5h window)
+// reddened EVERY tile's tag and every balance figure through .aiub-alarm;
+// isolation keeps zai's suffix, minimax's tag, and deepseek's money figure
+// in their own colors while the critical account still alarms itself.
+export function tileAlarmClass(entry) {
+    return isAlarming(entry) ? 'aiub-alarm' : '';
+}
+
+// The robot (single-account) label's alarm: bar-wide failures — a refresh
+// error or a vendor filter matching nothing — or the SHOWN account's own
+// urgency. Other accounts' critical headlines never reach it.
+export function robotAlarmClass(reportError, filterMiss, shown) {
+    if (reportError !== '' || filterMiss)
+        return 'aiub-alarm';
+    return tileAlarmClass(shown);
 }
 
 export function formatDuration(milliseconds) {
@@ -994,31 +931,3 @@ export const VENDOR_SLUGS = Object.freeze([
     'antigravity', 'cursor', 'minimax', 'kiro', 'opencode-go',
 ]);
 
-// Merge the static slug list with a parsed `usage --json` report (`null` when
-// the binary is missing or its output is unparseable). Report entries come
-// first in report order (enabled vendors first), labeled by the entry's
-// display_name — sanitized to its trim()med form, falling back to the slug
-// when the name is missing or blank; account entries (`<slug>@<label>`)
-// collapse to their first row; unknown report slugs (a vendor added upstream)
-// are kept. Every canonical slug absent from the report then follows in enum
-// order, labeled by its slug. Returns index-aligned {slugs, labels}.
-export function mergeVendorList(report, slugs = VENDOR_SLUGS) {
-    const merged = new Map();
-    const entries = report && Array.isArray(report.entries) ? report.entries : [];
-    for (const entry of entries) {
-        if (typeof entry?.id !== 'string')
-            continue;
-        const slug = entry.id.split('@', 1)[0];
-        if (!slug || merged.has(slug))
-            continue;
-        const name = entry?.display_name;
-        merged.set(slug, typeof name === 'string' && name.trim() ? name.trim() : slug);
-    }
-    for (const slug of slugs)
-        if (!merged.has(slug))
-            merged.set(slug, slug);
-    return {
-        slugs: [...merged.keys()],
-        labels: [...merged.values()],
-    };
-}

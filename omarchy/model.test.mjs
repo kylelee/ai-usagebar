@@ -199,8 +199,8 @@ assert.equal(model.preferredEntryId(openRouterAccounts, 'openrouter', 'openroute
 const priorWidgetSettings = {
   provider: '', refreshIntervalSec: 90, futureSetting: {keep: true}, id: 'stale-id'
 };
-const selectedWidgetSettings = model.settingsWithSelectedEntry(
-  priorWidgetSettings, 'ai-usagebar-omarchy', 'openrouter@personal');
+const selectedWidgetSettings = model.settingsWithOverrides(
+  priorWidgetSettings, 'ai-usagebar-omarchy', {lastSelectedEntryId: 'openrouter@personal'});
 assert.deepEqual(JSON.parse(JSON.stringify(selectedWidgetSettings)), {
   id: 'ai-usagebar-omarchy',
   provider: '',
@@ -209,7 +209,6 @@ assert.deepEqual(JSON.parse(JSON.stringify(selectedWidgetSettings)), {
   lastSelectedEntryId: 'openrouter@personal'
 });
 assert.equal(priorWidgetSettings.lastSelectedEntryId, undefined);
-assert.equal(model.settingsWithSelectedEntry({}, 'ai-usagebar-omarchy', ''), null);
 const hiddenValueSettings = model.settingsWithOverrides(
   selectedWidgetSettings, 'ai-usagebar-omarchy', {showValue: false});
 assert.equal(hiddenValueSettings.showValue, false);
@@ -232,33 +231,6 @@ assert.equal(model.booleanSetting(false, true), false);
 assert.equal(model.booleanSetting('false', true), false);
 assert.equal(model.booleanSetting('true', false), true);
 assert.equal(model.booleanSetting('invalid', true), true);
-
-assert.equal(model.barLabel(false, false, true, false, true, '29%'), '󰚩  29%');
-assert.equal(model.barLabel(false, false, false, false, true, '29%'), '󰚩');
-assert.equal(model.barLabel(true, false, true, false, true, '95%'), '󰚩  95%');
-assert.equal(model.barLabel(true, false, false, false, true, '95%'), '󰚩');
-assert.equal(model.barLabel(true, false, true, false, false, ''), '󰚩');
-assert.equal(model.barLabel(false, true, true, false, true, '29%'), '󰚩');
-assert.equal(model.barLabel(true, true, true, false, true, '95%'), '󰚩');
-assert.equal(model.barLabel(false, false, true, true, false, ''), '󰚩  …');
-
-// The provider tag is opt-in and arrives already resolved, so every call
-// above — no seventh argument at all — has to keep its historical label.
-assert.equal(model.barLabel(false, false, true, false, true, '29%', 'gpt'), '󰚩  gpt 29%');
-// Tag on, value off: the icon-only label grows the tag and nothing else.
-assert.equal(model.barLabel(false, false, false, false, true, '29%', 'gpt'), '󰚩  gpt');
-assert.equal(model.barLabel(true, false, true, false, true, '95%', 'cld'), '󰚩  cld 95%');
-// An entry with no headline still names its provider.
-assert.equal(model.barLabel(false, false, true, false, true, '', 'agy'), '󰚩  agy');
-// A vertical bar has no width for either field.
-assert.equal(model.barLabel(false, true, true, false, true, '29%', 'gpt'), '󰚩');
-// Before the first report there is no provider to name.
-assert.equal(model.barLabel(false, false, true, true, false, '', 'gpt'), '󰚩  …');
-assert.equal(model.barLabel(true, false, true, false, false, '', 'gpt'), '󰚩');
-// A tag that sanitizes down to nothing degrades to the label without one.
-assert.equal(model.barLabel(false, false, true, false, true, '29%', '   '), '󰚩  29%');
-assert.equal(model.barLabel(false, false, true, false, true, '29%', undefined), '󰚩  29%');
-
 // --- Tiled bar (every account at once, the old GNOME panel layout) --------
 // Fixed clock for the countdown assertions.
 const tileNow = Date.parse('2026-08-29T12:00:00Z');
@@ -274,17 +246,17 @@ assert.equal(model.tileTag({id: 'kimi'}), 'kimi');
 assert.equal(model.tileTag(null), '');
 // A tile leads with its headline figure plus that window's reset countdown.
 // The fixture's reset (2026-08-14) is in the fixed clock's past → "due".
-assert.equal(model.tileLabel(parsed.entries[0], true, false, tileNow), 'work 29%·due');
-assert.equal(model.tileLabel(parsed.entries[1], true, false, tileNow), 'openai 95%·-');
+assert.equal(model.tileLabel(parsed.entries[0], true, false, tileNow), 'work 29%↺due');
+assert.equal(model.tileLabel(parsed.entries[1], true, false, tileNow), 'openai 95%↺-');
 const kimiTile = model.parseReport(JSON.stringify({entries: [{
   id: 'kimi', short_name: 'kmi', error: null, sections: [
     {type: 'metric', label: 'Rolling window (5h)', percent: 38, value: '38%',
      detail: '', severity: 'low', reset_at: resetAt2h, window: 'session'}
   ]}
 ]})).entries[0];
-assert.equal(model.tileLabel(kimiTile, true, false, tileNow), 'kimi 38%·2h');
+assert.equal(model.tileLabel(kimiTile, true, false, tileNow), 'kimi 38%↺2h');
 // showRemaining flips the figure to what is left of the same window.
-assert.equal(model.tileLabel(kimiTile, true, true, tileNow), 'kimi 62%·2h');
+assert.equal(model.tileLabel(kimiTile, true, true, tileNow), 'kimi 62%↺2h');
 // headline carries the winning metric's reset for the tile to use.
 assert.equal(model.headline(kimiTile).reset_at, resetAt2h);
 // An unstarted window (no reset) keeps the countdown slot with a dash.
@@ -296,7 +268,7 @@ const unstarted = model.parseReport(JSON.stringify({entries: [{
      detail: '', severity: 'mid', reset_at: resetAt2h, window: 'weekly'}
   ]}
 ]})).entries[0];
-assert.equal(model.tileLabel(unstarted, true, false, tileNow), 'kimi 0%·- 37%·2h');
+assert.equal(model.tileLabel(unstarted, true, false, tileNow), 'kimi 0%↺- 37%↺2h');
 // Both windows tile, each with its own reset: 5h first, weekly second.
 const twoWindow = model.parseReport(JSON.stringify({entries: [{
   id: 'kimi', error: null, sections: [
@@ -306,8 +278,43 @@ const twoWindow = model.parseReport(JSON.stringify({entries: [{
      detail: '', severity: 'mid', reset_at: '2026-09-01T14:05:00Z', window: 'weekly'}
   ]}
 ]})).entries[0];
-assert.equal(model.tileLabel(twoWindow, true, false, tileNow), 'kimi 38%·2h 37%·3d');
-assert.equal(model.tileLabel(twoWindow, true, true, tileNow), 'kimi 62%·2h 63%·3d');
+assert.equal(model.tileLabel(twoWindow, true, false, tileNow), 'kimi 38%↺2h 37%↺3d');
+assert.equal(model.tileLabel(twoWindow, true, true, tileNow), 'kimi 62%↺2h 63%↺3d');
+
+// U9 (omarchy): MiniMax now exposes its text pool as two windows with the
+// exact labels Rust projects ("Session (5h)" / "Weekly"), and the video rows
+// sit behind them as `window: null` so the tile still picks the two text rows
+// in the same zai shape. Video rows never become tile figures even when the
+// plan reports them.
+const minimaxTile = model.parseReport(JSON.stringify({entries: [{
+  id: 'minimax', error: null, sections: [
+    {type: 'metric', label: 'Session (5h)', percent: 25, value: '25%',
+     detail: '', severity: 'low', reset_at: resetAt2h, window: 'session'},
+    {type: 'metric', label: 'Weekly', percent: 40, value: '40%',
+     detail: '', severity: 'low', reset_at: '2026-09-01T14:05:00Z', window: 'weekly'},
+    {type: 'metric', label: 'Video (5h)', percent: 30, value: '30%',
+     detail: '', severity: 'low', reset_at: '2026-08-29T22:00:00Z', window: null},
+    {type: 'metric', label: 'Video weekly', percent: 35, value: '35%',
+     detail: '', severity: 'low', reset_at: '2026-09-04T14:00:00Z', window: null}
+  ]
+}]})).entries[0];
+assert.equal(model.tileLabel(minimaxTile, true, false, tileNow),
+  'minimax 25%↺2h 40%↺3d',
+  'video rows do not leak into the tile — only the two text windows do');
+assert.equal(model.tileLabel(minimaxTile, true, true, tileNow),
+  'minimax 75%↺2h 60%↺3d',
+  'showRemaining flips both figures but still keeps video rows out');
+
+// A precomputed balance headline carries percent:null. showRemaining must
+// NOT flip it into a percentage — `Number(null)` is 0, so finitePercent used
+// to clamp null to 0 and render "100%" instead of the money figure.
+const balanceTile = model.parseReport(JSON.stringify({entries: [{
+  id: 'deepseek', error: null,
+  headline: {text: '¥58.40', percent: null, severity: 'low', label: 'Balance', reset_at: ''},
+  sections: [{type: 'text', label: 'Balance', value: '¥58.40'}]
+}]})).entries[0];
+assert.equal(model.tileLabel(balanceTile, true, true, tileNow), 'deepseek ¥58.40',
+  'a null-percent headline stays the balance figure, never "100%"');
 // A reset in the past reads as due.
 const dueTile = model.parseReport(JSON.stringify({entries: [{
   id: 'zai', short_name: 'zai', error: null, sections: [
@@ -315,7 +322,7 @@ const dueTile = model.parseReport(JSON.stringify({entries: [{
      detail: '', severity: 'low', reset_at: '2026-08-29T11:00:00Z', window: 'session'}
   ]}
 ]})).entries[0];
-assert.equal(model.tileLabel(dueTile, true, false, tileNow), 'zai 40%·due');
+assert.equal(model.tileLabel(dueTile, true, false, tileNow), 'zai 40%↺due');
 // Errored accounts degrade to the bare tag (the tiled bar filters them out,
 // this only guards direct callers).
 assert.equal(model.tileLabel(model.parseReport(JSON.stringify({entries: [{
@@ -330,7 +337,7 @@ assert.equal(model.tileLabel(parsed.entries[0], false, false, tileNow), 'work');
 // The tiled label joins one tile per WORKING account with a vertical bar;
 // unnamed defaults carry the provider name, named accounts their name only.
 assert.equal(model.tiledBarLabel(false, false, true, false, parsed.entries, false, tileNow),
-  'anthropic 29%·due│openai 95%·-');
+  'anthropic 29%↺due│openai 95%↺-');
 // Balance-style figures ride along like percentages do (no reset appended).
 assert.equal(model.tiledBarLabel(false, false, true, false,
   model.parseReport(JSON.stringify({entries: [
@@ -339,7 +346,7 @@ assert.equal(model.tiledBarLabel(false, false, true, false,
     ]},
     {id: 'deepseek', short_name: 'dsk', error: null,
      sections: [{type: 'text', label: 'Balance', value: '$8.42'}]}
-  ]})).entries, false, tileNow), 'zai 42%·-│deepseek $8.42',
+  ]})).entries, false, tileNow), 'zai 42%↺-│deepseek $8.42',
   'the solo zai key drops its suffix — the logo alone identifies it');
 // "unconfigured" is the calm third state: same remedy text, no alarm.
 const unconfiguredReport = model.parseReport(JSON.stringify({entries: [{
@@ -449,7 +456,7 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
   // Two zai keys: suffixes stay (they are what distinguishes the tiles);
   // the lone kimi key drops its "1".
   assert.equal(model.tiledBarLabel(false, false, true, false, providerPair, false, tileNow),
-    '1 42%·-│2 10%·-│kimi 30%·-');
+    '1 42%↺-│2 10%↺-│kimi 30%↺-');
   // An exhausted sibling still counts: zai@1 hidden, but zai@2 keeps "2".
   const exhaustedPair = model.parseReport(JSON.stringify({entries: [
     {id: 'zai@1', logo: 'zai', error: null, exhausted: true, sections: [
@@ -462,7 +469,7 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
     ]}
   ]})).entries;
   assert.equal(model.tiledBarLabel(false, false, true, false, exhaustedPair, false, tileNow),
-    '2 10%·-');
+    '2 10%↺-');
 }
 
 // Exhausted entries leave the bar but never the tabs: `exhausted` comes
@@ -492,7 +499,7 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
   assert.equal(model.barTileEntries([], 'x', false).length, 0);
   // The tiled label itself hides the exhausted tile.
   assert.equal(model.tiledBarLabel(false, false, true, false, exhaustion, false, tileNow),
-    'kimi 30%·-');
+    'kimi 30%↺-');
   assert.equal(model.tiledBarLabel(false, false, true, false, [exhaustion[0]], false, tileNow),
     '󰚩', 'every tile gone → the robot alone');
 }
@@ -514,9 +521,11 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
   const mk = (p1, p2) => model.parseReport(JSON.stringify({entries: [{
     id: 'zai@a', error: null, sections: [
       {type: 'metric', label: 'Session (5h)', percent: p1, value: p1 + '%',
-       detail: '', severity: 'low', reset_at: resetAt2h, window: 'session'},
+       detail: '', severity: 'low', reset_at: resetAt2h, window: 'session',
+       window_seconds: 5 * 3600},
       {type: 'metric', label: 'Weekly', percent: p2, value: p2 + '%',
-       detail: '', severity: 'low', reset_at: resetAt2h, window: 'weekly'}
+       detail: '', severity: 'low', reset_at: resetAt2h, window: 'weekly',
+       window_seconds: 7 * 24 * 3600}
     ]}
   ]})).entries[0];
   assert.equal(model.tileRemainingClass(mk(42, 15)), 'low');
@@ -526,9 +535,11 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
   assert.equal(model.tileRemainingClass(mk(50, 50)), 'low');
 
   // Per-FIGURE classes: the tag is class-less (theme foreground — the key
-  // name never changes color with usage), then the 5h and weekly figures
-  // each carry their own band — 99% left of the 5h window (green) beside
-  // 48% left of the weekly one (yellow) in ONE tile.
+  // name never changes color with usage), then each window splits into its
+  // percentage part and its ↺ countdown part — 99% left of the 5h window
+  // (green percentage) beside 48% left of the weekly one (yellow), each
+  // countdown colored by its own CLOCK: the shared reset sits 41.7% into
+  // the 5h window (yellow) but only 1.2% before the 7d one's end (red).
   // (Plain-copy first: parts live in the vm context, whose object prototype
   // never deep-equals a host-realm literal.)
   const plain = parts => {
@@ -538,25 +549,49 @@ assert.equal(model.isAlarming(unconfiguredReport[2]), true);
   };
   assert.deepEqual(plain(model.tileParts(mk(1, 52), true, false, tileNow)), [
     { text: 'a', cls: '' },
-    { text: '1%·2h', cls: 'low' },
-    { text: '52%·2h', cls: 'mid' }
+    { text: '1%', cls: 'low' },
+    { text: '↺2h', cls: 'mid' },
+    { text: '52%', cls: 'mid' },
+    { text: '↺2h', cls: 'critical' }
   ]);
   // Band edges on remaining: 13% left → orange (high), 47% left → yellow.
   assert.equal(model.remainingClass(87), 'high'); // 13% remaining
   assert.equal(model.remainingClass(53), 'mid');  // 47% remaining
   assert.equal(model.remainingClass(81), 'high'); // 19% remaining — orange's upper edge
   assert.equal(model.remainingClass(80), 'mid');  // 20% remaining — back to yellow
+  // The countdown bands share that remaining scale, keyed on the window's
+  // TIME left (1h of 5h = 20%, 1.1d of 7d = 15.7%) — the clock escalates
+  // independently of the usage percentage beside it.
+  assert.equal(model.countdownClass('2026-08-29T13:00:00Z', 5 * 3600, tileNow), 'mid',
+    '1h/5h = 20% of the clock left → yellow');
+  assert.equal(model.countdownClass('2026-08-30T14:24:00Z', 7 * 24 * 3600, tileNow), 'high',
+    '1.1d/7d = 15.7% of the clock left → orange');
+  assert.equal(model.countdownClass('2026-08-29T16:30:00Z', 5 * 3600, tileNow), 'low',
+    '4.5h/5h = 90% → green');
+  assert.equal(model.countdownClass('2026-08-29T12:10:00Z', 5 * 3600, tileNow), 'critical',
+    '10m/5h = 3.3% → red');
+  assert.equal(model.countdownClass('2026-08-29T11:00:00Z', 5 * 3600, tileNow), 'critical',
+    'a past reset is out of clock → red');
+  // Degradation: no window length (older binary, balance row) or an
+  // unparsable reset leaves the countdown class-less (neutral foreground).
+  assert.equal(model.countdownClass('2026-08-29T13:00:00Z', null, tileNow), '');
+  assert.equal(model.countdownClass('not-a-date', 5 * 3600, tileNow), '');
   // And the mirror: a critical 5h window beside a healthy weekly one —
   // the split goes both ways, never one color for the whole key.
   const mirror = plain(model.tileParts(mk(96, 8), true, false, tileNow));
-  assert.deepEqual(mirror[1], { text: '96%·2h', cls: 'critical' });
-  assert.deepEqual(mirror[2], { text: '8%·2h', cls: 'low' });
-  // tileLabel stays the joined form of the parts.
-  assert.equal(model.tileLabel(mk(1, 52), true, false, tileNow), 'a 1%·2h 52%·2h');
-  // showRemaining flips the figures; the classes stay remaining-based.
+  assert.deepEqual(mirror[1], { text: '96%', cls: 'critical' });
+  assert.deepEqual(mirror[2], { text: '↺2h', cls: 'mid' });
+  assert.deepEqual(mirror[3], { text: '8%', cls: 'low' });
+  assert.deepEqual(mirror[4], { text: '↺2h', cls: 'critical' });
+  // tileLabel stays the joined form of the parts — countdowns glued flush.
+  assert.equal(model.tileLabel(mk(1, 52), true, false, tileNow), 'a 1%↺2h 52%↺2h');
+  // showRemaining flips the figures; the classes stay remaining-based and
+  // the countdown parts do not move — a clock has no "remaining flip".
   const flipped = plain(model.tileParts(mk(1, 52), true, true, tileNow));
-  assert.deepEqual(flipped[1], { text: '99%·2h', cls: 'low' });
-  assert.deepEqual(flipped[2], { text: '48%·2h', cls: 'mid' });
+  assert.deepEqual(flipped[1], { text: '99%', cls: 'low' });
+  assert.deepEqual(flipped[2], { text: '↺2h', cls: 'mid' });
+  assert.deepEqual(flipped[3], { text: '48%', cls: 'mid' });
+  assert.deepEqual(flipped[4], { text: '↺2h', cls: 'critical' });
   // Balance-style accounts keep the single headline part, class-less.
   assert.deepEqual(plain(model.tileParts(model.parseReport(JSON.stringify({entries: [
     {id: 'deepseek', error: null, sections: [
@@ -710,7 +745,7 @@ assert.equal(model.preferredEntryId(readyFirst, '', ''), 'kimi');
 assert.equal(model.preferredEntryId(readyFirst, '', 'zai'), 'kimi');
 // Unconfigured entries tile no more than errors do — the panel keeps them.
 assert.equal(model.tiledBarLabel(false, false, true, false, unconfiguredReport, false, tileNow),
-  'Z.AI 42%·-');
+  'Z.AI 42%↺-');
 
 // Misconfigured entries (no key, broken config) stay OFF the bar…
 const mixedEntries = model.parseReport(JSON.stringify({entries: [
@@ -720,7 +755,7 @@ const mixedEntries = model.parseReport(JSON.stringify({entries: [
   ]}
 ]})).entries;
 assert.equal(model.tiledBarLabel(false, false, true, false, mixedEntries, false, tileNow),
-  'zai 42%·-');
+  'zai 42%↺-');
 // …and when every account is broken, the alert icon alone points at the panel.
 assert.equal(model.tiledBarLabel(false, false, true, false, [mixedEntries[0]], false, tileNow), '󰚩');
 // Empty/loading/vertical states mirror barLabel's.
@@ -729,17 +764,6 @@ assert.equal(model.tiledBarLabel(true, false, true, false, [], false, tileNow), 
 assert.equal(model.tiledBarLabel(true, true, true, false, parsed.entries, false, tileNow), '󰚩');
 assert.equal(model.tiledBarLabel(false, false, false, false, parsed.entries, false, tileNow),
   'anthropic│openai');
-
-// The codes come from Rust's VendorId::short_name via the report; the vendor
-// half of the machine id only stands in for a binary that predates the field.
-assert.equal(model.providerShort(parsed.entries[0]), 'cld');
-assert.equal(model.providerShort(parsed.entries[1]), 'gpt');
-assert.equal(model.providerShort({id: 'anthropic@work'}), 'anthropic');
-assert.equal(model.providerShort({id: 'anthropic_api'}), 'anthropic-api');
-assert.equal(model.providerShort({id: 'zai', short_name: '   '}), 'zai');
-assert.equal(model.providerShort(null), '');
-// Provider-controlled text can never reach Text.AutoText as markup.
-assert.equal(model.providerShort({id: 'x', short_name: '<b>x</b>'}), '‹b›x‹/b›');
 
 assert.equal(model.headline(parsed.entries[0]).text, '29%');
 assert.equal(model.headline(parsed.entries[1]).severity, 'critical');
@@ -1058,5 +1082,92 @@ assert.equal(model.buildSettingsPatch('openai', [{id: 'kimi', action: 'set', val
 assert.equal(model.buildSettingsPatch('openai', [{id: 'kimi', action: 'bogus'}]).ok, false);
 assert.equal(model.parseSettingsApplyResult('{"ok":true}'), true);
 assert.equal(model.parseSettingsApplyResult('{"ok":false}'), false);
+
+
+// --- Settings icon hygiene: one trash, one eraser ---------------------------
+// account-remove and key-clear both wore the trash glyph, and users clicked
+// key-clear believing they deleted the account: the key was wiped while the
+// now-empty account card stayed visible. The trash belongs to
+// removeAccountButton alone; drafts discard via the close X (U+F0156) and the
+// key row switches between eraser (U+F01FE) and undo (U+F054C).
+const actionBlock = (id) => settingsViewSource.slice(
+  settingsViewSource.indexOf(`id: ${id}`),
+  settingsViewSource.indexOf('onClicked:', settingsViewSource.indexOf(`id: ${id}`)));
+const keyClearBlock = actionBlock('accountKeyClear');
+assert.match(keyClearBlock, /\u{F01FE}/u, 'key-clear armed state must be the eraser, not the trash');
+assert.match(keyClearBlock, /\u{F054C}/u, 'key-clear keep state must be the undo arrow');
+assert.doesNotMatch(keyClearBlock, /\u{F01B4}/u, 'key-clear must not wear the trash glyph');
+assert.match(actionBlock('removeAccountButton'), /\u{F01B4}/u, 'the trash stays on removeAccountButton');
+assert.equal(settingsViewSource.split('\u{F01B4}').length - 1, 1,
+  'exactly one trash glyph in SettingsView — the account-remove button');
+assert.match(settingsViewSource,
+  /iconText: "\u{F0156}"\s*\n\s*tooltipText: "Discard this draft"/u,
+  'draft discard uses the close X, not a third trash can');
+
+
+// --- Card Apply stays clickable while a remove is armed ---------------------
+// The card's own Apply used to gate on !pendingRemove: clicking the header's
+// trash greyed out the very button that submits the remove, so users saw the
+// card dim and nothing happen — "the account won't go away". Inputs (fields,
+// key row) keep their pendingRemove gates; only the Apply must not.
+const applyBlocks = Array.from(settingsViewSource.matchAll(
+  /text: root\.saving \? "Saving…" : "Apply"[\s\S]*?enabled: ([^\n]+)/g));
+assert.ok(applyBlocks.length >= 2, 'draft and card Apply buttons must both exist');
+for (const [, enabled] of applyBlocks)
+  assert.doesNotMatch(enabled, /pendingRemove/,
+    'an Apply button must not gate on pendingRemove — the card Apply submits the remove');
+// The remove collection path the Apply feeds must survive any future refactor.
+assert.match(settingsViewSource, /function save\(\)/);
+assert.match(settingsViewSource, /collectChanges\(\), collectAccountChanges\(\)/);
+assert.match(settingsViewSource, /function collectAccountChanges\(\)/);
+assert.match(settingsViewSource,
+  /action: "remove", vendor: shape\.card\.vendor, label: shape\.accountLabel/);
+// The card's status text must name the armed state while it is armed.
+assert.match(settingsViewSource, /: accountCard\.pendingRemove \? "will remove"/);
+
+// --- save() carries primary only on change or outstanding intent ------------
+// `settings show` reports the RESOLVED primary (a configured-but-disabled
+// provider falls back to the first choice), and save() used to echo that
+// value into every patch — so a pure account-remove save silently rewrote
+// the user's [ui] primary in config.toml. The dropdown's value goes out
+// only when it differs from the snapshot; otherwise "" omits the field and
+// the backend leaves primary byte-for-byte untouched.
+// The snapshot diff alone can also swallow a ROLLBACK: the backend writes
+// primary BEFORE the account mutations, so a mid-save failure leaves the
+// file carrying the last-sent primary while snapshot.primary still holds
+// the old value. Until a successful save reloads, that intent must keep
+// re-sending the current selection instead of being diffed away.
+assert.match(settingsViewSource,
+  /property string lastSentPrimary: ""/,
+  'save() must track the outstanding primary intent on the root');
+assert.match(settingsViewSource,
+  /var sendPrimary = primaryChanged\s*\n\s*\|\|\s*\(lastSentPrimary !== "" && selectedPrimary !== ""\)/,
+  'primary goes out on change OR while an unconfirmed intent is outstanding');
+assert.match(settingsViewSource,
+  /buildSettingsPatch\(\s*sendPrimary \? selectedPrimary : ""\s*,/,
+  'the patch first argument flips between the selection and "" on sendPrimary');
+assert.doesNotMatch(settingsViewSource,
+  /buildSettingsPatch\(\s*selectedPrimary\s*,/,
+  'save() must not echo the resolved primary unconditionally');
+const saveBlock = settingsViewSource.slice(
+  settingsViewSource.indexOf('function save()'),
+  settingsViewSource.indexOf('function collectAccountChanges'));
+assert.match(saveBlock,
+  /lastSentPrimary = selectedPrimary/,
+  'the intent marker is recorded only when the patch actually carries primary');
+const finishLoadBlock = settingsViewSource.slice(
+  settingsViewSource.indexOf('function finishLoad'),
+  settingsViewSource.indexOf('function discard'));
+assert.match(finishLoadBlock,
+  /lastSentPrimary = ""/,
+  'a successful reload retires the outstanding primary intent');
+assert.doesNotMatch(
+  finishLoadBlock.slice(0, finishLoadBlock.indexOf('parseSettingsSnapshot')),
+  /lastSentPrimary/,
+  'failed loads must keep the outstanding primary intent alive');
+// canSave keeps gating on a non-empty selectedPrimary — untouched.
+assert.match(settingsViewSource,
+  /canSave: !loading && !saving\s*\n\s*&& \(selectedPrimary !== "" \|\| snapshot\.primary_choices\.length === 0\)/,
+  'canSave must keep requiring a non-empty selectedPrimary');
 
 console.log('Omarchy model tests passed');

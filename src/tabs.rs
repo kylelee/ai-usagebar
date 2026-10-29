@@ -749,12 +749,25 @@ pub(crate) struct SectionProjection {
     /// off the label the vendor itself supplied. Consumed by the report
     /// JSON and the aggregate bar so no frontend re-derives it.
     pub window: Option<&'static str>,
+    /// The window's total length in seconds, when the source reports (or
+    /// implies) one. Lets a frontend turn `reset_at` into the fraction of
+    /// the window's TIME still on the clock — the countdown figure's own
+    /// color band, independent of the usage percentage beside it.
+    pub window_seconds: Option<i64>,
 }
 
 /// Classify a metric row's window from its Rust-generated label
 /// ("Session (5h)", "Rolling window (5h)", "Weekly quota", …).
+///
+/// Labels containing "video" (MiniMax's video pool — `Video (5h)` /
+/// `Video weekly`) are deliberately excluded: the row stays in the report
+/// so the popup can show it, but `window` stays `None` so no status-bar
+/// tile can ever pick a video row as its window figure.
 pub(crate) fn metric_window(label: &str) -> Option<&'static str> {
     let lower = label.to_lowercase();
+    if lower.contains("video") {
+        return None;
+    }
     if lower.contains("session") || lower.contains("rolling") || lower.contains("5h") {
         Some("session")
     } else if lower.contains("week") {
@@ -780,6 +793,7 @@ impl SectionBuilder {
                         section,
                         reset_at: None,
                         window: None,
+                        window_seconds: None,
                     }
                 })
                 .collect(),
@@ -795,10 +809,19 @@ impl SectionBuilder {
             section,
             reset_at: None,
             window: None,
+            window_seconds: None,
         });
     }
 
-    fn push_metric(&mut self, section: Section, reset_at: Option<DateTime<Utc>>) {
+    /// `window_seconds` is the metric row's window length — the clock a
+    /// countdown color can be computed from. Rows without a window (balances,
+    /// spend, credits) pass `None`.
+    fn push_metric(
+        &mut self,
+        section: Section,
+        reset_at: Option<DateTime<Utc>>,
+        window_seconds: Option<i64>,
+    ) {
         assert!(matches!(section, Section::Metric { .. }));
         let window = match &section {
             Section::Metric { label, .. } => metric_window(label),
@@ -808,6 +831,7 @@ impl SectionBuilder {
             section,
             reset_at,
             window,
+            window_seconds,
         });
     }
 }
@@ -977,6 +1001,7 @@ fn anthropic_api_sections(s: &crate::usage::AnthropicApiSnapshot) -> SectionBuil
                     footnote: format!("{pct}% of monthly limit"),
                 },
                 None,
+                None,
             );
         }
         _ => {
@@ -1018,6 +1043,7 @@ fn openai_api_sections(s: &crate::usage::OpenAiApiSnapshot) -> SectionBuilder {
                     value_label: format!("{} of ${:.0}", usd(s.spent), limit),
                     footnote: format!("{pct}% of monthly limit"),
                 },
+                None,
                 None,
             );
         }
@@ -1102,6 +1128,7 @@ fn anthropic_sections(
                 value_label,
                 footnote,
             },
+            None,
             None,
         );
     }
@@ -1250,6 +1277,7 @@ fn openrouter_sections(s: &crate::usage::OpenRouterSnapshot) -> SectionBuilder {
             ),
         },
         None,
+        None,
     );
     v.push(Section::Spacer);
     v.push(Section::Block {
@@ -1345,6 +1373,7 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
                 footnote: "Auto + Composer".into(),
             },
             s.reset_at,
+            None,
         );
         v.push(Section::Spacer);
         v.push_metric(
@@ -1359,6 +1388,7 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
                 ),
             },
             s.reset_at,
+            None,
         );
     }
     v.push(Section::Spacer);
@@ -1377,10 +1407,13 @@ fn opencode_go_sections(
         left: "OpenCode Go".into(),
         right: None,
     }]);
-    for (label, window) in [
-        ("Rolling", s.rolling.as_ref()),
-        ("Weekly", s.weekly.as_ref()),
-        ("Monthly", s.monthly.as_ref()),
+    // The API names its buckets but never their lengths: rolling is the
+    // Claude-style 5h window and weekly rolls every 7d (the cadences the
+    // labels themselves claim); the monthly bucket is left clock-less.
+    for (label, window, window_secs) in [
+        ("Rolling", s.rolling.as_ref(), Some(5 * 3600)),
+        ("Weekly", s.weekly.as_ref(), Some(7 * 24 * 3600)),
+        ("Monthly", s.monthly.as_ref(), None),
     ] {
         if let Some(window) = window {
             let pct = window.percent.round().clamp(0.0, 100.0) as i32;
@@ -1393,6 +1426,7 @@ fn opencode_go_sections(
                     footnote: String::new(),
                 },
                 Some(window.resets_at),
+                window_secs,
             );
             sections.push(Section::Text {
                 label: "Resets".into(),
@@ -1425,6 +1459,7 @@ fn kiro_sections(s: &crate::usage::KiroSnapshot, now: DateTime<Utc>) -> SectionB
             footnote: format!("{:.2} of {:.0}", s.used, s.limit),
         },
         s.reset_at,
+        None,
     );
     v.push(Section::Spacer);
     v.push(Section::Text {
@@ -1434,34 +1469,28 @@ fn kiro_sections(s: &crate::usage::KiroSnapshot, now: DateTime<Utc>) -> SectionB
     v
 }
 
-/// MiniMax groups quota by model bucket, so the panel is laid out by window
-/// (Session, Weekly) with one row per pool — the same shape as Antigravity's
-/// two-group panel. Pacing is shown: both windows report a real duration, so
-/// the marker is meaningful.
+/// MiniMax tile shape, copied from [`zai_sections`]: a flat Title plus
+/// `Session (5h)` / `Weekly` rows for the text pool, optionally followed by
+/// `Video (5h)` / `Video weekly` rows when the plan carries a video quota.
+/// Video rows still appear in the popup (and the TUI panel) but carry
+/// `window: None` thanks to [`metric_window`]'s video exclusion, so no
+/// status-bar tile can ever pick a video row as its window figure.
 fn minimax_sections(
     s: &crate::usage::MinimaxSnapshot,
     now: DateTime<Utc>,
     tol: u32,
 ) -> SectionBuilder {
-    use crate::minimax::vendor::{POOL_GENERAL, POOL_VIDEO};
-
     let mut v = SectionBuilder::new(vec![Section::Title {
         left: s.plan.clone(),
         right: None,
     }]);
-    for (heading, general, video) in [
-        ("Session", &s.session, s.video_session.as_ref()),
-        ("Weekly", &s.weekly, s.video_weekly.as_ref()),
-    ] {
-        v.push(Section::Spacer);
-        v.push(Section::Text {
-            label: heading.into(),
-            value: String::new(),
-        });
-        push_window(&mut v, POOL_GENERAL, general, now, tol, true);
-        if let Some(w) = video {
-            push_window(&mut v, POOL_VIDEO, w, now, tol, true);
-        }
+    push_window(&mut v, "Session (5h)", &s.session, now, tol, true);
+    push_window(&mut v, "Weekly", &s.weekly, now, tol, true);
+    if let Some(w) = s.video_session.as_ref() {
+        push_window(&mut v, "Video (5h)", w, now, tol, true);
+    }
+    if let Some(w) = s.video_weekly.as_ref() {
+        push_window(&mut v, "Video weekly", w, now, tol, true);
     }
     v
 }
@@ -1561,6 +1590,9 @@ fn supergrok_sections(s: &crate::usage::SuperGrokSnapshot, now: DateTime<Utc>) -
             footnote: String::new(),
         },
         s.reset_at,
+        // Only the weekly bucket's cadence is known (7d); monthly and
+        // unknown periods carry no clock for a countdown band.
+        (s.period == crate::usage::SuperGrokPeriod::Weekly).then_some(7 * 24 * 3600),
     );
     v.push(Section::Spacer);
     v.push(Section::Text {
@@ -1638,6 +1670,9 @@ fn kimi_sections(s: &crate::usage::KimiSnapshot, now: DateTime<Utc>, _tol: u32) 
                 ),
             },
             s.window_reset_at,
+            // Kimi never reports lengths: the rolling bucket is the label's
+            // own 5h, the subscription bucket rolls every 7d (kimi/vendor.rs).
+            Some(5 * 3600),
         );
     }
 
@@ -1660,6 +1695,7 @@ fn kimi_sections(s: &crate::usage::KimiSnapshot, now: DateTime<Utc>, _tol: u32) 
             ),
         },
         s.weekly_reset_at,
+        Some(7 * 24 * 3600),
     );
 
     v
@@ -1694,6 +1730,7 @@ fn push_window(
             footnote,
         },
         w.resets_at,
+        Some(w.window_duration.num_seconds()),
     );
 }
 
@@ -2126,5 +2163,156 @@ mod tests {
             build_tabs(&config, &["gmail".into()], &no_creds()),
             vec![TabId::desktop_account("gmail")]
         );
+    }
+
+    // ── metric_window: video exclusion + existing classification pinning ────
+    // Pin the existing "session" / "weekly" classification (no prior test
+    // covered it) AND the new video exclusion rule.
+    #[test]
+    fn u1_metric_window_excludes_any_video_label() {
+        assert_eq!(metric_window("Video (5h)"), None);
+        assert_eq!(metric_window("Video weekly"), None);
+        assert_eq!(metric_window("Video"), None);
+        assert_eq!(metric_window("VIDEOS"), None, "case-insensitive");
+    }
+
+    #[test]
+    fn u2_metric_window_preserves_existing_classification() {
+        assert_eq!(metric_window("Session (5h)"), Some("session"));
+        assert_eq!(metric_window("Rolling window (5h)"), Some("session"));
+        assert_eq!(metric_window("Weekly"), Some("weekly"));
+        assert_eq!(metric_window("MCP tools (monthly)"), None);
+        assert_eq!(metric_window("Balance"), None);
+    }
+
+    // ── minimax_sections: flat zai-shape projection ──────────────────────
+    fn minimax_snapshot(
+        session_pct: i32,
+        weekly_pct: i32,
+        video_session: Option<(i32, chrono::Duration)>,
+        video_weekly: Option<(i32, chrono::Duration)>,
+    ) -> crate::usage::MinimaxSnapshot {
+        use crate::usage::UsageWindow;
+        let make = |pct: i32, dur: chrono::Duration| UsageWindow {
+            utilization_pct: pct,
+            resets_at: None,
+            window_duration: dur,
+        };
+        crate::usage::MinimaxSnapshot {
+            plan: "MiniMax".into(),
+            session: make(session_pct, chrono::Duration::hours(5)),
+            weekly: make(weekly_pct, chrono::Duration::days(7)),
+            video_session: video_session.map(|(p, d)| make(p, d)).map(|w| {
+                let mut w = w;
+                w.window_duration = chrono::Duration::hours(24);
+                w
+            }),
+            video_weekly: video_weekly.map(|(p, d)| make(p, d)).map(|mut w| {
+                w.window_duration = chrono::Duration::days(7);
+                w
+            }),
+        }
+    }
+
+    fn metric_label(s: &SectionProjection) -> Option<&str> {
+        match &s.section {
+            Section::Metric { label, .. } => Some(label.as_str()),
+            _ => None,
+        }
+    }
+
+    fn project_minimax(
+        s: &crate::usage::MinimaxSnapshot,
+        now: DateTime<Utc>,
+    ) -> Vec<SectionProjection> {
+        minimax_sections(s, now, pacing::DEFAULT_TOLERANCE).0
+    }
+
+    #[test]
+    fn u3_minimax_sections_text_windows_classify_and_keep_reset_order() {
+        let session_reset = Utc::now() + chrono::Duration::hours(2);
+        let weekly_reset = Utc::now() + chrono::Duration::days(3);
+        let mut snap = minimax_snapshot(25, 40, None, None);
+        snap.session.resets_at = Some(session_reset);
+        snap.weekly.resets_at = Some(weekly_reset);
+        let projected = project_minimax(&snap, Utc::now());
+
+        let metric_labels: Vec<&str> = projected.iter().filter_map(metric_label).collect();
+        assert_eq!(metric_labels, vec!["Session (5h)", "Weekly"]);
+        // First metric row carries window="session" + session reset; second
+        // carries window="weekly" + weekly reset — order pinned so a future
+        // reorder cannot silently flip tile resets.
+        assert_eq!(projected[2].window, Some("session"));
+        assert_eq!(projected[2].reset_at, Some(session_reset));
+        assert_eq!(projected[4].window, Some("weekly"));
+        assert_eq!(projected[4].reset_at, Some(weekly_reset));
+    }
+
+    #[test]
+    fn u4_minimax_sections_video_rows_classify_none_and_follow_text() {
+        let snap = minimax_snapshot(
+            10,
+            20,
+            Some((30, chrono::Duration::hours(24))),
+            Some((40, chrono::Duration::days(7))),
+        );
+        let projected = project_minimax(&snap, Utc::now());
+        let metric_labels: Vec<&str> = projected.iter().filter_map(metric_label).collect();
+        assert_eq!(
+            metric_labels,
+            vec!["Session (5h)", "Weekly", "Video (5h)", "Video weekly"],
+            "video rows follow the text rows"
+        );
+        // The text rows are windows; the video rows are not.
+        assert_eq!(projected[2].window, Some("session"));
+        assert_eq!(projected[4].window, Some("weekly"));
+        assert_eq!(projected[6].window, None, "Video (5h) must be window=None");
+        assert_eq!(
+            projected[8].window, None,
+            "Video weekly must be window=None"
+        );
+    }
+
+    #[test]
+    fn u5_minimax_sections_labels_match_zai_byte_for_text() {
+        let snap = minimax_snapshot(
+            0,
+            0,
+            Some((0, chrono::Duration::hours(24))),
+            Some((0, chrono::Duration::days(7))),
+        );
+        let projected = project_minimax(&snap, Utc::now());
+        let labels: Vec<&str> = projected.iter().filter_map(metric_label).collect();
+        // First two labels are the same strings Z.AI uses; video labels are
+        // the real wire pool name with the matching cadence marker.
+        assert_eq!(labels[0], "Session (5h)");
+        assert_eq!(labels[1], "Weekly");
+        assert_eq!(labels[2], "Video (5h)");
+        assert_eq!(labels[3], "Video weekly");
+    }
+
+    #[test]
+    fn u7_minimax_sections_handle_partial_and_full_video_absence() {
+        // No video at all: only the two text rows.
+        let no_video = minimax_snapshot(11, 22, None, None);
+        let projected = project_minimax(&no_video, Utc::now());
+        let labels: Vec<&str> = projected.iter().filter_map(metric_label).collect();
+        assert_eq!(labels, vec!["Session (5h)", "Weekly"]);
+
+        // Only video_session present: exactly one extra row.
+        let only_session_video =
+            minimax_snapshot(11, 22, Some((5, chrono::Duration::hours(24))), None);
+        let projected = project_minimax(&only_session_video, Utc::now());
+        let labels: Vec<&str> = projected.iter().filter_map(metric_label).collect();
+        assert_eq!(labels, vec!["Session (5h)", "Weekly", "Video (5h)"]);
+        // Pacing footnote must survive on every row (show_pacing is true).
+        for row in &projected {
+            if let Section::Metric { footnote, .. } = &row.section {
+                assert!(
+                    footnote.contains("Resets in"),
+                    "pacing footnote missing: {footnote}"
+                );
+            }
+        }
     }
 }

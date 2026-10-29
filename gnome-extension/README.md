@@ -23,8 +23,7 @@ Every account that reads successfully gets one compact tile, separated by
 icon):
 
 ```
-kimi 62%·5.3h 18%·2.3d │ anthropic 42%·2h 15%·2d
-```
+kimi 62%↺5.3h 18%↺2.3d │ anthropic 42%↺2h 15%↺2d
 
 - Each tile leads with its provider logo when a bundled asset ships; a
   named account adds its own name beside the logo, and a vendor's lone
@@ -34,14 +33,22 @@ kimi 62%·5.3h 18%·2.3d │ anthropic 42%·2h 15%·2d
   plate the Omarchy bar draws behind its tiles — so every figure stays
   legible and the tiles read as one group. The robot-icon fallback states
   carry no plate.
-- Each figure is colored by its own window's remaining band: green ≥50%
-  remaining, yellow <50%, orange <20%, red <5%. A green 5h figure can sit
-  beside an orange weekly one in the same tile; the account tag stays
-  neutral, and a critical figure also goes bold so the alert survives
-  color blindness.
-- Countdowns are compact one-unit forms (`42m`, `5.3h`, `2.3d`). A window
-  that has not started yet keeps its slot as `0%·-` so it lines up with
-  the figures that have timers.
+- Each figure is colored independently: the percentage by its own window's
+  remaining band (green ≥50% remaining, yellow <50%, orange <20%, red <5%)
+  and its `↺` countdown by how much of the window's TIME is left (1h of a
+  5h window counts as 20%, 1.1d of 7d as 15.7%) on that same band scale —
+  so a green 5h figure can sit beside an orange weekly one in the same
+  tile, and each clock escalates on its own; the account tag stays neutral,
+  and a critical part also goes bold so the alert survives color
+  blindness.
+- Alarms are per-account and never bleed across tiles: a tile's neutral
+  text turns red only when its OWN account is broken, stale, or critical —
+  one vendor maxing a window cannot redden another vendor's tag or balance
+  figure. The single-account robot fallback alarms on a refresh failure, a
+  vendor filter matching nothing, or the shown account's own urgency.
+- Countdowns are compact one-unit forms (`42m`, `5.3h`, `2.3d`), each
+  marked by `↺`. A window that has not started yet keeps its slot as
+  `0%↺-` so it lines up with the figures that have timers.
 - Balance-style accounts without quota windows (OpenRouter, DeepSeek, …)
   show their single headline figure instead.
 - Exhausted accounts (every window maxed, or a balance at zero) leave the
@@ -117,7 +124,7 @@ so.
 # then reload the shell:
 #   X11      → Alt+F2, type 'r', Enter
 #   Wayland  → log out / in
-gnome-extensions enable ai-usagebar-omarchy@kylelee.github.io
+gnome-extensions enable ai-usagebar@kylelee.github.io
 ```
 
 `install.sh` compiles the GSettings schema and copies this folder into
@@ -131,7 +138,7 @@ start.
 Settings dialog:
 
 ```bash
-gnome-extensions prefs ai-usagebar-omarchy@kylelee.github.io
+gnome-extensions prefs ai-usagebar@kylelee.github.io
 ```
 
 ## Settings

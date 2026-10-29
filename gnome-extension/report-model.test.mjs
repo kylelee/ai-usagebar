@@ -13,8 +13,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {
-    LOGO_ASSETS, VENDOR_SLUGS, accountTabs, buildSettingsPatch, compactReset, headline,
-    parseReport, parseSettingsSnapshot, providerName, remainingClass, tileParts
+    LOGO_ASSETS, VENDOR_SLUGS, accountTabs, buildSettingsPatch, compactReset, countdownClass,
+    headline, parseReport, parseSettingsSnapshot, providerName, remainingClass,
+    robotAlarmClass, tileAlarmClass, tileParts
 } from './report-model.js';
 
 // One clearly named block per contract area — new blocks append to the
@@ -86,7 +87,7 @@ runGroup('parseReport: valid multi-entry report', () => {
     assert.deepEqual(named.sections[0], {type: 'spacer'});
     assert.deepEqual(named.sections[1], {type: 'metric', label: 'Session (5h)', percent: 29,
         value: '29%', detail: 'Resets in 2h 0m · 60% elapsed · 31pts under', severity: 'low',
-        reset_at: '2026-08-14T14:00:00Z', window: 'session'});
+        reset_at: '2026-08-14T14:00:00Z', window: 'session', window_seconds: null});
     assert.deepEqual(named.sections[2], {type: 'text', label: 'Balance', value: '$12.00'});
     assert.deepEqual(named.sections[3], {type: 'block', label: 'Credits',
         body: ['balance: 20', '≈ 10 messages']});
@@ -190,8 +191,9 @@ runGroup('compactReset: one-unit countdowns', () => {
 runGroup('tileParts: tags, windows, placeholder, balance fallback', () => {
     const mkEntry = (id, sections) => parseReport(JSON.stringify(
         {entries: [{id: id, logo: 'zai', error: null, sections: sections}]})).entries[0];
-    const window = (percent, resetAt, win) => ({type: 'metric', label: 'Window', percent: percent,
-        value: percent + '%', detail: '', severity: 'low', reset_at: resetAt, window: win});
+    const window = (percent, resetAt, win, secs) => ({type: 'metric', label: 'Window',
+        percent: percent, value: percent + '%', detail: '', severity: 'low',
+        reset_at: resetAt, window: win, window_seconds: secs ?? null});
 
     // Multi-account: the suffix distinguishes siblings; the tag carries it
     // both as text and as the label beside the logo.
@@ -199,7 +201,8 @@ runGroup('tileParts: tags, windows, placeholder, balance fallback', () => {
         true, false, NOW);
     assert.deepEqual(multi, [
         {text: '1', cls: '', logo: 'zai', logoLabel: '1'},
-        {text: '42%·2h', cls: 'low'}
+        {text: '42%', cls: 'low'},
+        {text: '↺2h', cls: '', glue: true}
     ], 'multi-account tile keeps its suffix');
 
     // Solo: the provider's only entry drops the suffix; the provider name
@@ -208,7 +211,8 @@ runGroup('tileParts: tags, windows, placeholder, balance fallback', () => {
         true, false, NOW, true);
     assert.deepEqual(solo, [
         {text: 'zai', cls: '', logo: 'zai', logoLabel: ''},
-        {text: '42%·2h', cls: 'low'}
+        {text: '42%', cls: 'low'},
+        {text: '↺2h', cls: '', glue: true}
     ], 'solo tile degrades to the provider name');
 
     // A critical window carries cls 'critical' — bold is consumed at the
@@ -216,11 +220,13 @@ runGroup('tileParts: tags, windows, placeholder, balance fallback', () => {
     const critical = tileParts(mkEntry('kimi', [window(96, '2026-09-02T14:05:00Z', 'session')]),
         true, false, NOW);
     assert.equal(critical[1].cls, 'critical', 'critical window class');
-    assert.equal(critical[1].text, '96%·2h', 'critical text carries no bold markup');
+    assert.equal(critical[1].text, '96%', 'critical text carries no bold markup');
+    assert.equal(critical[2].text, '↺2h', 'the countdown is its own glued part');
 
     // A window not started yet keeps its slot as the dash placeholder.
     const unstarted = tileParts(mkEntry('kimi', [window(0, '', 'session')]), true, false, NOW);
-    assert.equal(unstarted[1].text, '0%·-', 'unstarted window placeholder');
+    assert.equal(unstarted[1].text, '0%', 'unstarted window placeholder percent');
+    assert.equal(unstarted[2].text, '↺-', 'unstarted window placeholder countdown');
 
     // Balance-style vendor (no windows): the single headline figure.
     const balance = tileParts(parseReport(JSON.stringify({entries: [{id: 'deepseek',
@@ -230,7 +236,87 @@ runGroup('tileParts: tags, windows, placeholder, balance fallback', () => {
         {text: 'deepseek', cls: '', logo: '', logoLabel: ''},
         {text: '$8.42', cls: ''}
     ], 'balance-style tile falls back to the headline figure');
+
+    // A precomputed balance headline carries percent:null — showRemaining
+    // must not flip null into "100%" (Number(null) is 0, so finitePercent
+    // used to clamp it). The money figure survives the flip request.
+    const withHeadline = tileParts(parseReport(JSON.stringify({entries: [{id: 'deepseek',
+        error: null,
+        headline: {text: '$8.42', percent: null, severity: 'low', label: 'Balance', reset_at: ''},
+        sections: [{type: 'text', label: 'Balance', value: '$8.42'}]}]})).entries[0],
+        true, true, NOW);
+    assert.deepEqual(withHeadline, [
+        {text: 'deepseek', cls: '', logo: '', logoLabel: ''},
+        {text: '$8.42', cls: ''}
+    ], 'null-percent headline keeps the balance figure under showRemaining');
 });
+
+// U9 (gnome): MiniMax exposes two text-pool windows AND optional video rows;
+// tileParts only surfaces the two windows (session, weekly), never the video
+// rows because they ship with window=null.
+runGroup('tileParts: minimax video rows never tile, text windows do', () => {
+    const mktwoWindow = (sess, weekly) => parseReport(JSON.stringify(
+        {entries: [{id: 'minimax', logo: 'minimax', error: null, sections: [
+            {type: 'metric', label: 'Session (5h)', percent: sess, value: sess + '%',
+             detail: '', severity: 'low', reset_at: '2026-09-02T14:05:00Z', window: 'session',
+             window_seconds: 5 * 3600},
+            {type: 'metric', label: 'Weekly', percent: weekly, value: weekly + '%',
+             detail: '', severity: 'low', reset_at: '2026-09-04T14:00:00Z', window: 'weekly',
+             window_seconds: 7 * 24 * 3600}
+        ]}]})).entries[0];
+    const two = tileParts(mktwoWindow(25, 40), true, false, NOW);
+    assert.deepEqual(two, [
+        {text: 'minimax', cls: '', logo: 'minimax', logoLabel: ''},
+        {text: '25%', cls: 'low'},
+        {text: '↺2h', cls: 'mid', glue: true},
+        {text: '40%', cls: 'low'},
+        {text: '↺2d', cls: 'mid', glue: true}
+    ], 'minimax text-pool windows tile in zai order; countdowns band on their own clocks');
+
+    // Video rows follow the text rows but never become tile parts because
+    // they carry window=null (Rust's metric_window rejects "video" labels).
+    const withVideo = parseReport(JSON.stringify(
+        {entries: [{id: 'minimax', logo: 'minimax', error: null, sections: [
+            {type: 'metric', label: 'Session (5h)', percent: 25, value: '25%',
+             detail: '', severity: 'low', reset_at: '2026-09-02T14:05:00Z', window: 'session'},
+            {type: 'metric', label: 'Weekly', percent: 40, value: '40%',
+             detail: '', severity: 'low', reset_at: '2026-09-04T14:00:00Z', window: 'weekly'},
+            {type: 'metric', label: 'Video (5h)', percent: 30, value: '30%',
+             detail: '', severity: 'low', reset_at: '2026-09-02T22:00:00Z', window: null},
+            {type: 'metric', label: 'Video weekly', percent: 35, value: '35%',
+             detail: '', severity: 'low', reset_at: '2026-09-07T14:00:00Z', window: null}
+        ]}]})).entries[0];
+    const parts = tileParts(withVideo, true, false, NOW);
+    assert.deepEqual(parts, [
+        {text: 'minimax', cls: '', logo: 'minimax', logoLabel: ''},
+        {text: '25%', cls: 'low'},
+        {text: '↺2h', cls: '', glue: true},
+        {text: '40%', cls: 'low'},
+        {text: '↺2d', cls: '', glue: true}
+    ], 'video rows excluded even when present in the report');
+});
+
+// ── countdownClass ────────────────────────────────────────────────────────
+runGroup('countdownClass: bands on the window clock, not the usage percent', () => {
+    // 1h left of a 5h window = 20% of the clock → mid; 1.1d of 7d = 15.7% →
+    // high; the countdown escalates independently of the percent beside it.
+    assert.equal(countdownClass('2026-09-02T13:00:00Z', 5 * 3600, NOW), 'mid',
+        '1h/5h = 20% of the clock left');
+    assert.equal(countdownClass('2026-09-03T14:24:00Z', 7 * 24 * 3600, NOW), 'high',
+        '1.1d/7d = 15.7% of the clock left');
+    assert.equal(countdownClass('2026-09-02T16:30:00Z', 5 * 3600, NOW), 'low',
+        '4.5h/5h = 90% of the clock left');
+    assert.equal(countdownClass('2026-09-02T12:10:00Z', 5 * 3600, NOW), 'critical',
+        '10m/5h = 3.3% of the clock left');
+    assert.equal(countdownClass('2026-09-02T11:00:00Z', 5 * 3600, NOW), 'critical',
+        'a past reset is out of clock');
+    // Degradation: no window length (older binary, balance row) or an
+    // unparsable reset leaves the countdown class-less (neutral).
+    assert.equal(countdownClass('2026-09-02T13:00:00Z', null, NOW), '');
+    assert.equal(countdownClass('', 5 * 3600, NOW), '');
+    assert.equal(countdownClass('not-a-date', 5 * 3600, NOW), '');
+});
+
 
 // ── buildSettingsPatch ────────────────────────────────────────────────────
 runGroup('buildSettingsPatch: valid keys and account changes', () => {
@@ -830,6 +916,96 @@ runGroup('install scripts: install-bin.sh owns the binary deploy', () => {
     assert.ok(!fs.existsSync(new URL('../scripts/install.sh', import.meta.url)),
         'the omarchy installer is scripts/install-omarchy.sh — the old bare ' +
         'scripts/install.sh must not come back');
+});
+
+// ── alarm isolation ───────────────────────────────────────────────────────
+runGroup('alarm isolation: one vendor\'s urgency never recolors another tile', () => {
+    // The live incident: kimi's 5h window is maxed (critical headline,
+    // exhausted), zai/minimax/deepseek are calm. The old bar-wide _alarming
+    // reddened EVERY tile's neutral text — zai's "1"/"2" suffix, minimax's
+    // tag, deepseek's whole money figure — through .aiub-alarm.
+    const parsed = parseReport(JSON.stringify({entries: [
+        {
+            id: 'zai@1', name: 'zai · 1', display_name: 'Z.AI · 1', logo: 'zai',
+            status: 'ready', stale: false,
+            headline: {text: '62%', percent: 62, severity: 'mid', label: 'Session (5h)'},
+            sections: [
+                {type: 'metric', label: 'Session (5h)', percent: 62, value: '62%',
+                    severity: 'mid', window: 'session'},
+                {type: 'metric', label: 'Weekly', percent: 55, value: '55%',
+                    severity: 'mid', window: 'weekly'}
+            ]
+        },
+        {
+            id: 'minimax@1', name: 'minimax · 1', display_name: 'MiniMax', logo: 'minimax',
+            status: 'ready', stale: false,
+            headline: {text: '1%', percent: 1, severity: 'low', label: 'Session (5h)'},
+            sections: [
+                {type: 'metric', label: 'Session (5h)', percent: 1, value: '1%',
+                    severity: 'low', window: 'session'},
+                {type: 'metric', label: 'Weekly', percent: 2, value: '2%',
+                    severity: 'low', window: 'weekly'}
+            ]
+        },
+        {
+            id: 'deepseek@1', name: 'deepseek · 1', display_name: 'DeepSeek', logo: 'deepseek',
+            status: 'ready', stale: false,
+            headline: {text: '¥58.40', percent: null, severity: 'low', label: 'Balance'},
+            sections: [{type: 'text', label: 'Balance', value: '¥58.40'}]
+        },
+        {
+            id: 'kimi', name: 'kimi', display_name: 'Kimi', logo: 'kimi',
+            status: 'ready', stale: false, exhausted: true,
+            headline: {text: '100%', percent: 100, severity: 'critical',
+                label: 'Rolling window (5h)'},
+            sections: [
+                {type: 'metric', label: 'Rolling window (5h)', percent: 100, value: '100%',
+                    severity: 'critical', window: 'session'},
+                {type: 'metric', label: 'Weekly quota', percent: 20, value: '20%',
+                    severity: 'low', window: 'weekly'}
+            ]
+        }
+    ]}));
+    const [zai, minimax, deepseek, kimi] = parsed.entries;
+    assert.equal(tileAlarmClass(kimi), 'aiub-alarm',
+        'the maxed account still alarms its own tile');
+    assert.equal(tileAlarmClass(zai), '', 'zai\'s tag keeps its neutral color');
+    assert.equal(tileAlarmClass(minimax), '', 'minimax\'s tag keeps its neutral color');
+    assert.equal(tileAlarmClass(deepseek), '',
+        'the balance figure keeps its neutral color');
+
+    // Stale data alarms its OWN tile too — isAlarming's other real half.
+    const stale = parseReport(JSON.stringify({entries: [{
+        id: 'zai', name: 'zai', display_name: 'Z.AI', status: 'ready', stale: true,
+        headline: {text: '10%', percent: 10, severity: 'low', label: 'Session (5h)'},
+        sections: [{type: 'metric', label: 'Session (5h)', percent: 10, value: '10%',
+            severity: 'low', window: 'session'}]
+    }]})).entries[0];
+    assert.equal(tileAlarmClass(stale), 'aiub-alarm', 'a stale account alarms its own tile');
+
+    // The robot (single-account) label: bar-wide failures or the SHOWN
+    // account's own urgency — never a sibling vendor's critical headline.
+    assert.equal(robotAlarmClass('', false, zai), '', 'calm shown account, calm robot');
+    assert.equal(robotAlarmClass('', false, kimi), 'aiub-alarm',
+        'the shown account\'s urgency reddens its own robot');
+    assert.equal(robotAlarmClass('usage command failed', false, zai), 'aiub-alarm',
+        'a refresh failure still alarms');
+    assert.equal(robotAlarmClass('', true, null), 'aiub-alarm',
+        'a filter miss alarms the robot');
+    assert.equal(robotAlarmClass('', false, null), '', 'plain loading stays calm');
+});
+
+// Structural gate: the render layer must keep the per-tile wiring — a
+// bar-wide alarm class applied to every tile label is exactly the regression
+// that painted zai's suffix and deepseek's balance red while kimi was maxed.
+runGroup('extension.js wiring: tiles alarm per account, never bar-wide', () => {
+    const src = fs.readFileSync(new URL('./extension.js', import.meta.url), 'utf8');
+    assert.ok(src.includes('tileAlarmClass(entry)'),
+        'each tile label carries its own account\'s alarm class');
+    assert.ok(!src.includes('worstBand'),
+        'no bar-wide worst-band alarm source may remain in the render layer');
+    assert.ok(!/_alarming\b/.test(src),
+        'the bar-wide _alarming walker must not come back');
 });
 
 for (const line of summary) console.log(line);

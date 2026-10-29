@@ -7,7 +7,7 @@ Parent: `../AGENTS.md`.
 
 ```
 package/metadata.json           # KPlugin manifest — Id MUST equal Makefile PLASMOID_ID
-package/contents/code/plasmoid-logic.mjs (538)  # PURE adapter: report JSON → display model
+package/contents/code/plasmoid-logic.mjs (536)  # PURE adapter: report JSON → display model
 package/contents/ui/            # main.qml + widgets + config/*.qml (KConfigXT)
 package/contents/config/main.xml
 plasmoid-logic.test.mjs         # node tests — part of `make desktop-test` (Windows CI too)
@@ -32,7 +32,7 @@ install.sh                      # user install helper; Makefile install-plasmoid
   (`src/active.rs`) — per-applet vendor selection via KConfigXT config instead.
   The GNOME extension + Waybar share the cycle file; don't "unify" this.
 - `plasmoid-logic.mjs` is its own pure module — NOT a copy of gnome's
-  `marker-logic.js` (different data shape, different tests). Keep both pure so
+  `report-model.js` (different data shape, different tests). Keep both pure so
   their node suites run on any CI OS.
 - V4 engine constraints for ALL .mjs here: no optional-catch-binding, no
   `\p{...}` regex, stick to ES2020-level syntax Node already accepts.

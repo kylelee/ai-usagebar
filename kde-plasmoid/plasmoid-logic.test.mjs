@@ -7,7 +7,7 @@ import {fileURLToPath} from 'node:url';
 import {
     buildArgv, buildCommand, buildTuiCommand, DEFAULT_BINARY, DEFAULT_TUI_BINARY,
     DEFAULT_TIMEOUT_SECS, detailRows, entryFor, errorMessage, EXIT_KILLED,
-    EXIT_TIMED_OUT, formatDuration, headline, isAlarming, LEGACY_BINARY,
+    EXIT_TIMED_OUT, formatDuration, headline, LEGACY_BINARY,
     LEGACY_TUI_BINARY, LOGO_ASSETS, logoAssetName, MAX_TIMEOUT_SECS,
     MIN_TIMEOUT_SECS, metricDetail, metricTone, nextVendor, paletteFromTheme,
     panelCells, parseReport, resetRemainingMs, safeText, severityColor,
@@ -280,18 +280,21 @@ const pre = headline(precomputed);
 assert.equal(pre.text, '$75.00');
 assert.equal(pre.severity, 'high');
 assert.equal(pre.label, 'Credit balance');
+// A balance-row headline carries percent:null — `Number(null)` is 0, so
+// finitePercent must keep null (a 0 would read as a maxed/empty window to
+// every 100-x consumer).
+const balancePre = parseReport(JSON.stringify({entries: [{
+    id: 'deepseek',
+    headline: {text: '¥58.40', percent: null, severity: 'low', label: 'Balance'},
+    sections: [{type: 'text', label: 'Balance', value: '¥58.40'}],
+}]})).entries[0];
+assert.equal(headline(balancePre).percent, null);
 // null (nothing reportable) falls back to the local walk → "Ready".
 const noHeadline = parseReport(JSON.stringify({entries: [{
     id: 'vendor', headline: null,
     sections: [{type: 'text', label: 'Vendor', value: 'text'}],
 }]})).entries[0];
 assert.equal(headline(noHeadline).text, 'Ready');
-
-assert.equal(isAlarming(anthropic), true, 'a critical window is alarming');
-assert.equal(isAlarming(openai), true, 'so is stale data');
-assert.equal(isAlarming(zai), true, 'so is an errored vendor');
-assert.equal(isAlarming(null), false);
-
 // Spacers are dropped: Column spacing sets the rhythm, so keeping them would
 // double it.
 assert.equal(detailRows(anthropic).length, 2);

@@ -161,15 +161,29 @@ pub(crate) struct Headline {
 
 /// Build the entry's [`Headline`] from its projected sections.
 fn headline_for_sections(sections: &[ReportSection]) -> Option<Headline> {
-    let pick = headline_pick(sections.iter().filter_map(|section| match section {
+    // Pick over the DENSE candidate list and index that same list. Spacers
+    // and the title sit between the metric rows in `sections`, so feeding
+    // `headline_pick` a filtered iterator while indexing the full array made
+    // the precomputed headline describe a row *neighbouring* the winner (a
+    // 25% session window led while the 40% weekly one was the fullest).
+    let candidates: Vec<&ReportSection> = sections
+        .iter()
+        .filter(|section| {
+            matches!(
+                section,
+                ReportSection::Metric { .. } | ReportSection::Text { .. }
+            )
+        })
+        .collect();
+    let pick = headline_pick(candidates.iter().map(|section| match section {
         ReportSection::Metric {
             label,
             percent,
             value,
             ..
-        } => Some((label.as_str(), Some(*percent), value.as_str())),
-        ReportSection::Text { label, value } => Some((label.as_str(), None, value.as_str())),
-        _ => None,
+        } => (label.as_str(), Some(*percent), value.as_str()),
+        ReportSection::Text { label, value } => (label.as_str(), None, value.as_str()),
+        _ => unreachable!("the filter admits only metric and text rows"),
     }))?;
     match pick {
         HeadlinePick::Metric(index) => {
@@ -180,7 +194,7 @@ fn headline_for_sections(sections: &[ReportSection]) -> Option<Headline> {
                 severity,
                 reset_at,
                 ..
-            } = &sections[index]
+            } = candidates[index]
             else {
                 return None;
             };
@@ -199,7 +213,7 @@ fn headline_for_sections(sections: &[ReportSection]) -> Option<Headline> {
             })
         }
         HeadlinePick::BalanceRow(index) => {
-            let ReportSection::Text { label, value } = &sections[index] else {
+            let ReportSection::Text { label, value } = candidates[index] else {
                 return None;
             };
             Some(Headline {
@@ -265,6 +279,10 @@ enum ReportSection {
         /// Server-classified rolling window ("session" | "weekly") — the
         /// single source for bar-tile window picking on every frontend.
         window: Option<&'static str>,
+        /// The window's length in seconds, when known. With `reset_at` it
+        /// gives the fraction of the window's time still on the clock — the
+        /// countdown figure's own color band, independent of `percent`.
+        window_seconds: Option<i64>,
     },
     Text {
         label: String,
@@ -417,6 +435,7 @@ fn entry_from_state(tab: &TabId, state: &TabState, now: chrono::DateTime<Utc>) -
                     severity: severity.as_str().into(),
                     reset_at: projected.reset_at,
                     window: projected.window,
+                    window_seconds: projected.window_seconds,
                 });
             }
             Section::Text { label, value } => {
@@ -506,6 +525,7 @@ fn render_json_for_primary(entries: &[Entry], primary: Option<&str>) -> String {
                         severity,
                         reset_at,
                         window,
+                        window_seconds,
                     } => Some(json!({
                         "label": label,
                         "percent": percent,
@@ -514,6 +534,7 @@ fn render_json_for_primary(entries: &[Entry], primary: Option<&str>) -> String {
                         "severity": severity,
                         "reset_at": reset_at,
                         "window": window,
+                        "window_seconds": window_seconds,
                     })),
                     _ => None,
                 })
@@ -627,7 +648,8 @@ mod tests {
     use crate::error::AppError;
     use crate::tabs::ReadyTab;
     use crate::usage::{
-        DeepseekSnapshot, KimiSnapshot, KiroSnapshot, OpenRouterSnapshot, VendorSnapshot,
+        DeepseekSnapshot, KimiSnapshot, KiroSnapshot, MinimaxSnapshot, OpenRouterSnapshot,
+        UsageWindow, VendorSnapshot,
     };
     use crate::vendor::VendorId;
 
@@ -735,6 +757,7 @@ mod tests {
             severity: "mid".into(),
             reset_at: None,
             window: None,
+            window_seconds: None,
         }
     }
 
@@ -1263,6 +1286,161 @@ mod tests {
         assert_eq!(
             solo.display_name, "Kimi",
             "solo display must be the provider name from the id, not a split artifact"
+        );
+    }
+
+    /// U6: report JSON contract — text rows expose window="session"/"weekly"
+    /// with ordered resets, and video rows expose window as a JSON `null`
+    /// (not a missing key) so a future metric_window regression that
+    /// re-classifies a video row would surface immediately.
+    #[test]
+    fn u6_report_json_carries_minimax_windows_and_video_null() {
+        let session_reset = Utc::now() + chrono::Duration::hours(2);
+        let weekly_reset = Utc::now() + chrono::Duration::days(3);
+        let state = TabState::Ready(Box::new(ReadyTab {
+            snapshot: VendorSnapshot::Minimax(MinimaxSnapshot {
+                plan: "MiniMax Pro".into(),
+                session: UsageWindow {
+                    utilization_pct: 25,
+                    resets_at: Some(session_reset),
+                    window_duration: chrono::Duration::hours(5),
+                },
+                weekly: UsageWindow {
+                    utilization_pct: 40,
+                    resets_at: Some(weekly_reset),
+                    window_duration: chrono::Duration::days(7),
+                },
+                video_session: Some(UsageWindow {
+                    utilization_pct: 30,
+                    resets_at: Some(Utc::now() + chrono::Duration::hours(10)),
+                    window_duration: chrono::Duration::hours(24),
+                }),
+                video_weekly: Some(UsageWindow {
+                    utilization_pct: 35,
+                    resets_at: Some(Utc::now() + chrono::Duration::days(5)),
+                    window_duration: chrono::Duration::days(7),
+                }),
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: None,
+        }));
+        let entry = entry_from_state(&TabId::vendor(VendorId::Minimax), &state, Utc::now());
+        let rendered = render_json_for_primary(&[entry], None);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let sections = value["entries"][0]["sections"]
+            .as_array()
+            .expect("sections must be an array");
+        // Walk every metric section: text rows expose their windows, video
+        // rows expose `null` and carry a label that contains "Video".
+        let mut session_seen = false;
+        let mut weekly_seen = false;
+        let mut video_session_seen = false;
+        let mut video_weekly_seen = false;
+        for (idx, section) in sections.iter().enumerate() {
+            if section["type"] != "metric" {
+                continue;
+            }
+            let label = section["label"].as_str().unwrap_or("");
+            match label {
+                "Session (5h)" => {
+                    assert_eq!(
+                        section["window"],
+                        serde_json::Value::String("session".into()),
+                        "Session (5h) window must be 'session' (idx={idx})"
+                    );
+                    assert_eq!(
+                        section["reset_at"],
+                        serde_json::Value::String(
+                            session_reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+                        ),
+                        "Session (5h) reset_at must match input order"
+                    );
+                    // The window's own clock rides along: with the reset it
+                    // gives the countdown figure its time-remaining band.
+                    assert_eq!(
+                        section["window_seconds"],
+                        serde_json::json!(5 * 3600),
+                        "Session (5h) window_seconds must be the 5h clock (idx={idx})"
+                    );
+                    session_seen = true;
+                }
+                "Weekly" => {
+                    assert_eq!(
+                        section["window"],
+                        serde_json::Value::String("weekly".into()),
+                        "Weekly window must be 'weekly' (idx={idx})"
+                    );
+                    assert_eq!(
+                        section["reset_at"],
+                        serde_json::Value::String(
+                            weekly_reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+                        ),
+                        "Weekly reset_at must match input order"
+                    );
+                    assert_eq!(
+                        section["window_seconds"],
+                        serde_json::json!(7 * 24 * 3600),
+                        "Weekly window_seconds must be the 7d clock (idx={idx})"
+                    );
+                    weekly_seen = true;
+                }
+                "Video (5h)" => {
+                    assert_eq!(
+                        section["window"],
+                        serde_json::Value::Null,
+                        "Video (5h) window must serialize as JSON null, not missing"
+                    );
+                    assert!(section.get("window").is_some(), "window key present");
+                    video_session_seen = true;
+                }
+                "Video weekly" => {
+                    assert_eq!(
+                        section["window"],
+                        serde_json::Value::Null,
+                        "Video weekly window must serialize as JSON null, not missing"
+                    );
+                    assert!(section.get("window").is_some(), "window key present");
+                    video_weekly_seen = true;
+                }
+                other => panic!("unexpected metric label: {other}"),
+            }
+        }
+        assert!(session_seen && weekly_seen, "text rows must be present");
+        assert!(
+            video_session_seen && video_weekly_seen,
+            "video rows must be present when the snapshot reports them"
+        );
+
+        // Order pinned: text rows come before video rows in the array, so
+        // a future reorder cannot silently let a video row lead the list.
+        let labels: Vec<&str> = sections
+            .iter()
+            .filter(|s| s["type"] == "metric")
+            .map(|s| s["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Session (5h)", "Weekly", "Video (5h)", "Video weekly"]
+        );
+
+        // The precomputed headline rides these same sections (see
+        // `entry_from_state`): the fullest window leads and carries its own
+        // reset, so a no-window fallback surface (or an older binary's local
+        // walk) can never disagree with the window rows pinned above.
+        let headline = &value["entries"][0]["headline"];
+        assert_eq!(
+            headline["label"], "Weekly",
+            "fullest row leads (40% > 25/30/35)"
+        );
+        assert_eq!(headline["text"], "40%");
+        assert_eq!(headline["percent"], 40);
+        assert_eq!(
+            headline["reset_at"],
+            serde_json::Value::String(
+                weekly_reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            ),
+            "the headline window's reset travels with the pick"
         );
     }
 }

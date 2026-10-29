@@ -103,7 +103,11 @@ async fn fetch_live_with_sibling_fallback(
     api_key: &str,
 ) -> Result<MinimaxSnapshot> {
     match fetch_live(client, endpoints, api_key).await {
-        Err(err @ AppError::Http { status: 401 | 403, .. }) => {
+        Err(
+            err @ AppError::Http {
+                status: 401 | 403, ..
+            },
+        ) => {
             let Some(sibling) = endpoints.sibling.clone() else {
                 return Err(err);
             };
